@@ -49,7 +49,6 @@ CAVE_SIZE = 0x60
 CAVES = {1: 0xFFFFFFF00B9D0500, 2: 0xFFFFFFF00B9D0560, 3: 0xFFFFFFF00B9D05C0, 4: 0xFFFFFFF00B9D0620,
          5: 0xFFFFFFF00B9D04A0}  # stage 5 (paint yellow) reuses the zero padding between the entry and CAVES[1]
                                  # so the panic screen keeps its room after CAVES[2].
-DLXK_LINK_VA = 0xFFFFFFF00BE7782C  # _image4_dlxk_link: AppleImage4 kext registers its API once
 TIMEBASE = 19200000
 
 PAINT = """
@@ -71,31 +70,10 @@ PAINT = """
   dsb sy
 """
 
-# Yellow band for stage 5: fuxi's fixed panel geometry (1080x2400, row 4320 bytes, 32 bpp,
-# base 0xB8000000). Band index 3 = below DarwinBoot's green, the blue and the magenta bands.
-YELLOW_PAINT = """
-  movz x1, #0xB800, lsl #16
-  mov  x2, #4320
-  mov  x3, #2400
-  mul  x2, x2, x3
-  lsr  x2, x2, #4
-  bic  x2, x2, #7
-  mov  x4, #3
-  mul  x5, x2, x4
-  add  x1, x1, x5
-  movz w6, #0xFF00
-  movk w6, #0xFFFF, lsl #16
-1:
-  stp  w6, w6, [x1], #8
-  subs x2, x2, #8
-  b.hi 1b
-  dsb  sy
-"""
-
 SOURCES = {
     1: ".text\n.global _start\n_start:\n" + PAINT.format(args='x0', band=1, lo='0x00FF', hi='0xFF00') + "  b target\n",
-    2: ".text\n.global _start\n_start:\n" + PAINT.format(args='x20', band=2, lo='0xFF00', hi='0xFFFF')
-       + "  msr SCTLR_EL1, x0\n  b target\n",
+    2: ".text\n.global _start\n_start:\n" + PAINT.format(args='x20', band=2, lo='0x00FF', hi='0xFFFF')
+       + "  b yellow\n",
     3: """.text
 .global _start
 _start:
@@ -140,7 +118,8 @@ _start:
   wfe
   b 2b
 """ + ".ltorg\n",
-    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  ret\n",
+    5: ".text\n.global _start\n_start:\n" + PAINT.format(args='x20', band=3, lo='0xFF00', hi='0xFFFF')
+       + "  msr SCTLR_EL1, x0\n  b target\n",
 }
 
 RESET_BEFORE = """.text
@@ -313,7 +292,7 @@ def rebase(kernel, data):
     _panic and _vinfo come from the symbol table when the kernel has one (the plain source
     kernel does); the retained candidate layout is the unshifted case.
     """
-    global ENTRY_VA, START_FIRST_CPU, MMU_ENABLE_VA, AFTER_MMU_VA, PANIC_VA, VINFO_VA, PANIC_CAVE_END, CAVES, DLXK_LINK_VA
+    global ENTRY_VA, START_FIRST_CPU, MMU_ENABLE_VA, AFTER_MMU_VA, PANIC_VA, VINFO_VA, PANIC_CAVE_END, CAVES
     delta = unixthread_pc(data) - ENTRY_VA
     if delta:
         ENTRY_VA += delta
@@ -349,8 +328,6 @@ def rebase(kernel, data):
         # mappings, then pin it to their retained GOP mapping. Ordinary source
         # kernels without the observer retain the original vinfo path.
         VINFO_VA = names.get('_boot_progress_panic_vinfo', names['_vinfo'])
-    if '_image4_dlxk_link' in names:
-        DLXK_LINK_VA = names['_image4_dlxk_link']
     return names
 
 
@@ -406,18 +383,15 @@ def main():
     for va, value in expected.items():
         if word(va) != value:
             raise SystemExit(f'{va:#x} holds {word(va):#010x}, expected {value:#010x}: not the kernel these probes are for')
-    yellow_site = DLXK_LINK_VA + 0x10
-    if args.paint_yellow and word(yellow_site) != 0xD65F03C0:
-        raise SystemExit(f'{yellow_site:#x} is not `ret`: not the AppleImage4 dlxk_link this probe expects')
     for va in CAVES.values():
         if any(data[file_offset(va):file_offset(va) + CAVE_SIZE]):
             raise SystemExit(f'Padding at {va:#x} is not empty')
 
     # (site, cave stage, symbols the cave is linked with)
     sites = [(ENTRY_VA, 1, {'target': START_FIRST_CPU}),
-             (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4})]
+             (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4, 'yellow': CAVES[5]})]
     if args.paint_yellow:
-        sites.append((yellow_site, 5, {}))
+        sites.append((None, 5, {'target': MMU_ENABLE_VA + 4}))
     if args.no_reset:
         description = 'no reset probe'
     elif args.reset_after:
@@ -429,7 +403,7 @@ def main():
         sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
     if args.paint_yellow:
-        description += ', yellow band after _image4_dlxk_link'
+        description += ', yellow band below the other three'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
@@ -439,6 +413,8 @@ def main():
                 raise SystemExit(f'Stage {stage} code is too large')
             data[file_offset(CAVES[stage]):file_offset(CAVES[stage]) + len(code)] = code
     for site, stage, _ in sites:
+        if site is None:
+            continue
         struct.pack_into('<I', data, file_offset(site), branch(site, CAVES[stage]))
     if args.panic_screen:
         # Right after the last probe cave in use, so the padding is shared as tightly as possible.
