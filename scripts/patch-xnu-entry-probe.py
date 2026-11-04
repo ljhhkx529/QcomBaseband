@@ -70,10 +70,33 @@ PAINT = """
   dsb sy
 """
 
+# Yellow band for stage 5. This runs after the MMU is on, so it draws through
+# the kernel's vinfo (v_baseaddr is the mapped framebuffer), not the boot-args
+# physical address. Band index 3 = below DarwinBoot's green, blue and magenta.
+YELLOW_PAINT = """
+  ldr  x1, =vinfo
+  ldr  w2, [x1, #12]
+  ldr  w3, [x1, #0]
+  ldr  x1, [x1, #16]
+  mul  x2, x2, x3
+  lsr  x2, x2, #4
+  bic  x2, x2, #7
+  mov  x4, #3
+  mul  x5, x2, x4
+  add  x1, x1, x5
+  movz w6, #0xFF00
+  movk w6, #0xFFFF, lsl #16
+1:
+  stp  w6, w6, [x1], #8
+  subs x2, x2, #8
+  b.hi 1b
+  dsb  sy
+"""
+
 SOURCES = {
     1: ".text\n.global _start\n_start:\n" + PAINT.format(args='x0', band=1, lo='0x00FF', hi='0xFF00') + "  b target\n",
     2: ".text\n.global _start\n_start:\n" + PAINT.format(args='x20', band=2, lo='0x00FF', hi='0xFFFF')
-       + "  b yellow\n",
+       + "  msr SCTLR_EL1, x0\n  b target\n",
     3: """.text
 .global _start
 _start:
@@ -118,8 +141,7 @@ _start:
   wfe
   b 2b
 """ + ".ltorg\n",
-    5: ".text\n.global _start\n_start:\n" + PAINT.format(args='x20', band=3, lo='0xFF00', hi='0xFFFF')
-       + "  msr SCTLR_EL1, x0\n  b target\n",
+    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  bl callee\n  b target\n.ltorg\n",
 }
 
 RESET_BEFORE = """.text
@@ -389,9 +411,11 @@ def main():
 
     # (site, cave stage, symbols the cave is linked with)
     sites = [(ENTRY_VA, 1, {'target': START_FIRST_CPU}),
-             (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4, 'yellow': CAVES[5]})]
+             (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4})]
     if args.paint_yellow:
-        sites.append((None, 5, {'target': MMU_ENABLE_VA + 4}))
+        symbols = kernel_symbols(args.kernel)
+        call_va, callee = find_call(data, symbols, '_arm_init', '_PE_create_console', 1)
+        sites.append((call_va, 5, {'callee': callee, 'target': call_va + 4, 'vinfo': VINFO_VA}))
     if args.no_reset:
         description = 'no reset probe'
     elif args.reset_after:
@@ -403,7 +427,7 @@ def main():
         sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
     if args.paint_yellow:
-        description += ', yellow band below the other three'
+        description += ', yellow band after _PE_create_console'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
