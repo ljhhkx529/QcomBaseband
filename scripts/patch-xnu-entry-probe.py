@@ -415,7 +415,7 @@ def main():
     if args.paint_yellow:
         symbols = kernel_symbols(args.kernel)
         call_va, callee = find_call(data, symbols, '_arm_init', '_PE_create_console', 1)
-        sites.append((call_va, 5, {'callee': callee, 'target': call_va + 4, 'vinfo': VINFO_VA}))
+        sites.append((call_va, 5, {'callee': callee, 'target': call_va + 4, 'vinfo': kernel_names.get('_vinfo', VINFO_VA)}))
     if args.no_reset:
         description = 'no reset probe'
     elif args.reset_after:
