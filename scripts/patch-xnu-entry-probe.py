@@ -196,6 +196,26 @@ def find_call(data, symbols, function, name, occurrence):
     return hits[occurrence - 1]
 
 
+def find_call_anywhere(data, symbols, name, occurrence=1):
+    """The VA and target of the Nth `bl name` anywhere in the kernel text."""
+    hits = []
+    for vmaddr, vmsize, fileoff, filesize in SEGMENTS:
+        if not filesize:
+            continue
+        limit = min(vmsize, filesize)
+        for va in range(vmaddr, vmaddr + limit, 4):
+            word = struct.unpack_from('<I', data, fileoff + (va - vmaddr))[0]
+            if word >> 26 == 0b100101:
+                delta = word & 0x3FFFFFF
+                delta -= (1 << 26) if delta & (1 << 25) else 0
+                target = va + delta * 4
+                if symbols.get(target) == name:
+                    hits.append((va, target))
+    if len(hits) < occurrence:
+        raise SystemExit(f'No bl {name} found ({len(hits)} hits)')
+    return hits[occurrence - 1]
+
+
 def assemble_c(source, va, workdir, symbols):
     """Build a freestanding C file for VA; returns (bytes, load address of the first byte, address of panic_screen).
 
@@ -414,7 +434,7 @@ def main():
              (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4})]
     if args.paint_yellow:
         symbols = kernel_symbols(args.kernel)
-        call_va, callee = find_call(data, symbols, '_arm_init', '_PE_create_console', 1)
+        call_va, callee = find_call_anywhere(data, symbols, '_bsd_init', 1)
         sites.append((call_va, 5, {'callee': callee, 'target': call_va + 4, 'vinfo': kernel_names.get('_vinfo', VINFO_VA)}))
     if args.no_reset:
         description = 'no reset probe'
@@ -427,7 +447,7 @@ def main():
         sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
     if args.paint_yellow:
-        description += ', yellow band after _PE_create_console'
+        description += ', yellow band after _bsd_init'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
