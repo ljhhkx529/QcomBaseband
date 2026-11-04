@@ -142,7 +142,7 @@ _start:
   wfe
   b 2b
 """ + ".ltorg\n",
-    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  bl callee\n  b target\n.ltorg\n",
+    5: ".text\n.global _start\n_start:\n  .inst 0x52800068\n  .inst 0xb90ecf28\n" + YELLOW_PAINT + "  b target\n.ltorg\n",
 }
 
 RESET_BEFORE = """.text
@@ -461,8 +461,11 @@ def main():
     if args.paint_yellow:
         symbols = kernel_symbols(args.kernel)
         call_va, callee = find_call(data, symbols, '_load_init_program', '_mount', 1)
-        sites.append((call_va, 5, {'callee': callee, 'target': call_va + 4, 'vinfo': kernel_names.get('_vinfo', VINFO_VA),
-                                    'stage': kernel_names.get('_native_owner_data_stage')}))
+        site = call_va + 0x8  # mov w8,#3; str w8,[x25,#0xecc] writes stage=3 right after mount returns
+        if word(site) != 0x52800068 or word(site + 4) != 0xB90ECF28:
+            raise SystemExit('Data mount stage=3 write not found or changed')
+        sites.append((site, 5, {'target': site + 8, 'vinfo': kernel_names.get('_vinfo', VINFO_VA),
+                                'stage': kernel_names.get('_native_owner_data_stage')}))
     if args.no_reset:
         description = 'no reset probe'
     elif args.reset_after:
@@ -474,7 +477,7 @@ def main():
         sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
     if args.paint_yellow:
-        description += ', yellow band at the Data mount call'
+        description += ', yellow band at stage=3 after Data mount returns'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
