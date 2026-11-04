@@ -142,7 +142,7 @@ _start:
   wfe
   b 2b
 """ + ".ltorg\n",
-    5: ".text\n.global _start\n_start:\n  .inst 0x52800068\n  .inst 0xb90ecf28\n" + YELLOW_PAINT + "  b target\n.ltorg\n",
+    5: ".text\n.global _start\n_start:\n  .inst 0x52800088\n  .inst 0xb90ecf28\n" + YELLOW_PAINT + "  b target\n.ltorg\n",
 }
 
 RESET_BEFORE = """.text
@@ -240,6 +240,25 @@ def find_dlxk_link_ret(data):
                 return vmaddr + i + 12  # address of the `ret`
             i += 4
     raise SystemExit('image4_dlxk_link sequence not found')
+
+
+def find_stage4_write(data):
+    """Locate the Data-mount stage=4 write (mov w8,#4; str w8,[x25,#0xecc])."""
+    mov = struct.pack('<I', 0x52800088)
+    st = struct.pack('<I', 0xB90ECF28)
+    for vmaddr, vmsize, fileoff, filesize in SEGMENTS:
+        if not filesize:
+            continue
+        region = data[fileoff:fileoff + min(vmsize, filesize)]
+        i = 0
+        while True:
+            i = region.find(mov, i)
+            if i < 0:
+                break
+            if region[i + 4:i + 8] == st:
+                return vmaddr + i
+            i += 4
+    raise SystemExit('Data mount stage=4 write not found')
 
 
 def assemble_c(source, va, workdir, symbols):
@@ -459,11 +478,7 @@ def main():
     sites = [(ENTRY_VA, 1, {'target': START_FIRST_CPU}),
              (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4})]
     if args.paint_yellow:
-        symbols = kernel_symbols(args.kernel)
-        call_va, callee = find_call(data, symbols, '_load_init_program', '_mount', 1)
-        site = call_va + 0x8  # mov w8,#3; str w8,[x25,#0xecc] writes stage=3 right after mount returns
-        if word(site) != 0x52800068 or word(site + 4) != 0xB90ECF28:
-            raise SystemExit('Data mount stage=3 write not found or changed')
+        site = find_stage4_write(data)
         sites.append((site, 5, {'target': site + 8, 'vinfo': kernel_names.get('_vinfo', VINFO_VA),
                                 'stage': kernel_names.get('_native_owner_data_stage')}))
     if args.no_reset:
@@ -477,7 +492,7 @@ def main():
         sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
     if args.paint_yellow:
-        description += ', yellow band at stage=3 after Data mount returns'
+        description += ', yellow band at stage=4 (Data mount complete)'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
