@@ -141,7 +141,7 @@ _start:
   wfe
   b 2b
 """ + ".ltorg\n",
-    5: ".text\n.global _start\n_start:\n  bl callee\n" + YELLOW_PAINT + "  b target\n.ltorg\n",
+    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  ret\n.ltorg\n",
 }
 
 RESET_BEFORE = """.text
@@ -214,6 +214,31 @@ def find_call_anywhere(data, symbols, name, occurrence=1):
     if len(hits) < occurrence:
         raise SystemExit(f'No bl {name} found ({len(hits)} hits)')
     return hits[occurrence - 1]
+
+
+def find_dlxk_link_ret(data):
+    """Locate image4_dlxk_link's `ret` by its unique instruction sequence.
+
+    The symbol is stripped from the prelinked kernel, but the function body is
+    stable: adrp x8; ldr x9,[x8,#off]; cbnz x9,+8; str x0,[x8,#off]; ret.
+    """
+    ldr = bytes.fromhex('09e542f9')  # 0xf942e509 little-endian
+    for vmaddr, vmsize, fileoff, filesize in SEGMENTS:
+        if not filesize:
+            continue
+        region = data[fileoff:fileoff + min(vmsize, filesize)]
+        i = 0
+        while True:
+            i = region.find(ldr, i)
+            if i < 0:
+                break
+            w1 = struct.unpack_from('<I', region, i + 4)[0]
+            w2 = struct.unpack_from('<I', region, i + 8)[0]
+            w3 = struct.unpack_from('<I', region, i + 12)[0]
+            if w1 == 0xB5000069 and w2 == 0xF902E500 and w3 == 0xD65F03C0:
+                return vmaddr + i + 12  # address of the `ret`
+            i += 4
+    raise SystemExit('image4_dlxk_link sequence not found')
 
 
 def assemble_c(source, va, workdir, symbols):
@@ -433,9 +458,8 @@ def main():
     sites = [(ENTRY_VA, 1, {'target': START_FIRST_CPU}),
              (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4})]
     if args.paint_yellow:
-        symbols = kernel_symbols(args.kernel)
-        call_va, callee = find_call_anywhere(data, symbols, '_bsd_init', 1)
-        sites.append((call_va, 5, {'callee': callee, 'target': call_va + 4, 'vinfo': kernel_names.get('_vinfo', VINFO_VA)}))
+        yellow_site = find_dlxk_link_ret(data)
+        sites.append((yellow_site, 5, {'vinfo': kernel_names.get('_vinfo', VINFO_VA)}))
     if args.no_reset:
         description = 'no reset probe'
     elif args.reset_after:
@@ -447,7 +471,7 @@ def main():
         sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
     if args.paint_yellow:
-        description += ', yellow band after _bsd_init'
+        description += ', yellow band after image4_dlxk_link'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
