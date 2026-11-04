@@ -141,7 +141,7 @@ _start:
   wfe
   b 2b
 """ + ".ltorg\n",
-    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  .inst 0xaa0003f3\n  b target\n.ltorg\n",
+    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  .inst 0xaa1603e0\n  b target\n.ltorg\n",
 }
 
 RESET_BEFORE = """.text
@@ -458,9 +458,9 @@ def main():
     sites = [(ENTRY_VA, 1, {'target': START_FIRST_CPU}),
              (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4})]
     if args.paint_yellow:
-        probe_va = kernel_names.get('_native_ufs_store_open')
-        if probe_va is None or word(probe_va) != 0xAA0003F3:
-            raise SystemExit('_native_ufs_store_open not found or its entry changed')
+        probe_va = kernel_names.get('_native_ufs_store_read')
+        if probe_va is None or word(probe_va) != 0xAA1603E0:
+            raise SystemExit('_native_ufs_store_read not found or its entry changed')
         sites.append((probe_va, 5, {'target': probe_va + 4, 'vinfo': kernel_names.get('_vinfo', VINFO_VA)}))
     if args.no_reset:
         description = 'no reset probe'
@@ -473,7 +473,7 @@ def main():
         sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
     if args.paint_yellow:
-        description += ', yellow band at native_ufs_store_open'
+        description += ', yellow band at native_ufs_store_read'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
