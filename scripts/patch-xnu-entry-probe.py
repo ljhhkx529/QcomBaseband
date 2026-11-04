@@ -141,7 +141,7 @@ _start:
   wfe
   b 2b
 """ + ".ltorg\n",
-    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  bl callee\n  b target\n.ltorg\n",
+    5: ".text\n.global _start\n_start:\n  bl callee\n" + YELLOW_PAINT + "  b target\n.ltorg\n",
 }
 
 RESET_BEFORE = """.text
