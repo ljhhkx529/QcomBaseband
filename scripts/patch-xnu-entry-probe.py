@@ -141,7 +141,7 @@ _start:
   wfe
   b 2b
 """ + ".ltorg\n",
-    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  .inst 0xd2800004\n  b target\n.ltorg\n",
+    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  .inst 0xf900009f\n  b target\n.ltorg\n",
 }
 
 RESET_BEFORE = """.text
@@ -458,10 +458,11 @@ def main():
     sites = [(ENTRY_VA, 1, {'target': START_FIRST_CPU}),
              (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4})]
     if args.paint_yellow:
-        probe_va = kernel_names.get('_native_ram_block_volume_device')
-        if probe_va is None or word(probe_va) != 0xD2800004:
-            raise SystemExit('_native_ram_block_volume_device not found or its entry changed')
-        sites.append((probe_va, 5, {'target': probe_va + 4, 'vinfo': kernel_names.get('_vinfo', VINFO_VA)}))
+        seed_va = kernel_names.get('_native_ram_block_volume_seed')
+        site = seed_va + 0xC if seed_va else None
+        if seed_va is None or site is None or word(site) != 0xF900009F:
+            raise SystemExit('_native_ram_block_volume_seed not found or its body changed')
+        sites.append((site, 5, {'target': site + 4, 'vinfo': kernel_names.get('_vinfo', VINFO_VA)}))
     if args.no_reset:
         description = 'no reset probe'
     elif args.reset_after:
@@ -473,7 +474,7 @@ def main():
         sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
     if args.paint_yellow:
-        description += ', yellow band at native_ram_block_volume_device'
+        description += ', yellow band at native_ram_block_volume_seed'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
