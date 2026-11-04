@@ -74,14 +74,15 @@ PAINT = """
 # the kernel's vinfo (v_baseaddr is the mapped framebuffer), not the boot-args
 # physical address. Band index 3 = below DarwinBoot's green, blue and magenta.
 YELLOW_PAINT = """
+  ldr  x9, =stage
+  ldr  w11, [x9]
   ldr  x9, =vinfo
   ldr  w10, [x9, #12]
-  ldr  w11, [x9, #0]
+  ldr  w13, [x9, #0]
   ldr  x9, [x9, #16]
-  mul  x10, x10, x11
+  mul  x10, x10, x13
   lsr  x10, x10, #4
   bic  x10, x10, #7
-  mov  x11, #3
   mul  x12, x10, x11
   add  x9, x9, x12
   movz w13, #0xFF00
@@ -461,7 +462,8 @@ def main():
         probe_va = kernel_names.get('_native_ufs_store_read')
         if probe_va is None or word(probe_va) != 0xAA1603E0:
             raise SystemExit('_native_ufs_store_read not found or its entry changed')
-        sites.append((probe_va, 5, {'target': probe_va + 4, 'vinfo': kernel_names.get('_vinfo', VINFO_VA)}))
+        sites.append((probe_va, 5, {'target': probe_va + 4, 'vinfo': kernel_names.get('_vinfo', VINFO_VA),
+                                    'stage': kernel_names.get('_native_owner_data_stage')}))
     if args.no_reset:
         description = 'no reset probe'
     elif args.reset_after:
