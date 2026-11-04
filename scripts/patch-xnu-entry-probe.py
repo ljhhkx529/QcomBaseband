@@ -94,7 +94,7 @@ YELLOW_PAINT = """
 
 SOURCES = {
     1: ".text\n.global _start\n_start:\n" + PAINT.format(args='x0', band=1, lo='0x00FF', hi='0xFF00') + "  b target\n",
-    2: ".text\n.global _start\n_start:\n" + PAINT.format(args='x20', band=2, lo='0x00FF', hi='0xFFFF')
+    2: ".text\n.global _start\n_start:\n" + PAINT.format(args='x20', band=2, lo='0xFF00', hi='0xFFFF')
        + "  msr SCTLR_EL1, x0\n  b target\n",
     3: """.text
 .global _start
