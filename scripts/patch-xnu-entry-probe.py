@@ -74,21 +74,21 @@ PAINT = """
 # the kernel's vinfo (v_baseaddr is the mapped framebuffer), not the boot-args
 # physical address. Band index 3 = below DarwinBoot's green, blue and magenta.
 YELLOW_PAINT = """
-  ldr  x1, =vinfo
-  ldr  w2, [x1, #12]
-  ldr  w3, [x1, #0]
-  ldr  x1, [x1, #16]
-  mul  x2, x2, x3
-  lsr  x2, x2, #4
-  bic  x2, x2, #7
-  mov  x4, #3
-  mul  x5, x2, x4
-  add  x1, x1, x5
-  movz w6, #0xFF00
-  movk w6, #0xFFFF, lsl #16
+  ldr  x9, =vinfo
+  ldr  w10, [x9, #12]
+  ldr  w11, [x9, #0]
+  ldr  x9, [x9, #16]
+  mul  x10, x10, x11
+  lsr  x10, x10, #4
+  bic  x10, x10, #7
+  mov  x11, #3
+  mul  x12, x10, x11
+  add  x9, x9, x12
+  movz w13, #0xFF00
+  movk w13, #0xFFFF, lsl #16
 1:
-  stp  w6, w6, [x1], #8
-  subs x2, x2, #8
+  stp  w13, w13, [x9], #8
+  subs x10, x10, #8
   b.hi 1b
   dsb  sy
 """
@@ -141,7 +141,7 @@ _start:
   wfe
   b 2b
 """ + ".ltorg\n",
-    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  ret\n.ltorg\n",
+    5: ".text\n.global _start\n_start:\n" + YELLOW_PAINT + "  .inst 0xa9bd57f6\n  b target\n.ltorg\n",
 }
 
 RESET_BEFORE = """.text
@@ -458,8 +458,10 @@ def main():
     sites = [(ENTRY_VA, 1, {'target': START_FIRST_CPU}),
              (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4})]
     if args.paint_yellow:
-        yellow_site = find_dlxk_link_ret(data)
-        sites.append((yellow_site, 5, {'vinfo': kernel_names.get('_vinfo', VINFO_VA)}))
+        probe_va = kernel_names.get('__ZN9NativeUfs5probeEP9IOServicePi')
+        if probe_va is None or word(probe_va) != 0xA9BD57F6:
+            raise SystemExit('NativeUfs::probe not found or its entry changed')
+        sites.append((probe_va, 5, {'target': probe_va + 4, 'vinfo': kernel_names.get('_vinfo', VINFO_VA)}))
     if args.no_reset:
         description = 'no reset probe'
     elif args.reset_after:
@@ -471,7 +473,7 @@ def main():
         sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
     if args.paint_yellow:
-        description += ', yellow band after image4_dlxk_link'
+        description += ', yellow band at NativeUfs::probe'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
