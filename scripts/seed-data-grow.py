@@ -109,8 +109,14 @@ def main():
             listing = plistlib.loads(subprocess.check_output(['diskutil', 'apfs', 'list', '-plist']))
             container = None
             for entry in listing['Containers']:
-                if any(s['DeviceIdentifier'] == store for s in entry.get('PhysicalStores', [])):
-                    container = entry['ContainerReference']
+                if entry.get('ContainerReference') == store:
+                    container = store
+                    break
+            if not container:
+                for entry in listing['Containers']:
+                    if any(s['DeviceIdentifier'] == store for s in entry.get('PhysicalStores', [])):
+                        container = entry['ContainerReference']
+                        break
             if not container:
                 sys.exit('No APFS container found on the attached seed')
             run('diskutil', 'apfs', 'resizeContainer', container, '0')
