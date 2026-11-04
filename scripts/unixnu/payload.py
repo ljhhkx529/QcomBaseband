@@ -162,10 +162,11 @@ def build(ctx, kernel=None):
     payloads.mkdir(parents=True)
     shutil.copyfile(kernel, payloads / 'kernel.macho')
     # The entry probe (stage bars, optional reset) is wanted with either setting; the panic screen is only one part of it.
-    if spec.get('panic_screen') or spec.get('entry_probe_reset_delay'):
+    if spec.get('panic_screen') or spec.get('entry_probe_reset_delay') or spec.get('paint_yellow'):
         probe = (['--reset-delay', str(int(spec['entry_probe_reset_delay']))]
                  if spec.get('entry_probe_reset_delay') else ['--no-reset'])
         screen = ['--panic-screen'] if spec.get('panic_screen') else []
+        paint = ['--paint-yellow'] if spec.get('paint_yellow') else []
         if spec.get('entry_probe_reset_delay') and spec.get('entry_probe_reset_after'):
             # Stage 4 in place of stage 3: reset after the Nth call to SYMBOL in FUNCTION.
             probe += ['--reset-after', spec['entry_probe_reset_after'], '--in', spec.get('entry_probe_reset_in', '_arm_init'),
@@ -173,7 +174,7 @@ def build(ctx, kernel=None):
             if spec.get('entry_probe_reset_before'):
                 # At the call site, without making the call (and without the delay).
                 probe.append('--reset-before')
-        run(['python3', ctx.tree / 'scripts/patch-xnu-entry-probe.py', payloads / 'kernel.macho', *screen, *probe],
+        run(['python3', ctx.tree / 'scripts/patch-xnu-entry-probe.py', payloads / 'kernel.macho', *screen, *probe, *paint],
             cwd=ctx.tree, env=dict(os.environ, UNIXNU_UEFI=str(ctx.uefi or '')), log_file=ctx.logs / 'payload-patch.log')
         # The probes rewrite instructions inside __text, which the source corecrypto POST hashes.
         if b'_source_corecrypto14_bootstrap\0' in Path(kernel).read_bytes():
