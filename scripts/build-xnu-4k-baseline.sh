@@ -35,6 +35,12 @@ if [ ! -x .cache/fakeroot/usr/local/libexec/availability.pl ]; then
     DSTROOT="$ROOT/.cache/fakeroot" CMAKE="$(command -v cmake)" NINJA="$(command -v ninja)"
 fi
 # Format 2 prepares its ordered patch series through the shared resolver.
+# QcomXnuUsbDebug's boot-progress hook edits pe_kprintf.c inside zzz-boot-progress.patch's context, so
+# it is reversed first and re-applied after the module patches below; otherwise the series stops on a
+# modified file.
+if [ -f "$ROOT/scripts/fuxi-usb-boot-progress.py" ] && [ "${XNU_NATIVE_USB_DEBUG:-0}" = 1 ]; then
+  python3 "$ROOT/scripts/fuxi-usb-boot-progress.py" "$ROOT/.cache/xnu-work" --reverse || true
+fi
 if [ -z "${UNIXNU_PATCH_LIST:-}" ]; then
 # The optional observation hooks overlap existing root/exec patch context.
 # Remove them first so earlier independent patches retain their idempotent checks.
@@ -53,6 +59,28 @@ for PATCH in "$ROOT"/patches/xnu/*.patch "$ROOT"/kits/XnuPrelink/patches/*.patch
     git -C .cache/xnu-work apply "$PATCH"
   fi
 done
+fi
+# QcomXnuUsbDebug: apply the module's Darwin23/fuxi console profile once the board series is in place,
+# then re-apply the boot-progress hook that hands qcom_usb_debug_init() the console. The bootstrap pass
+# runs before build-fuxi-usb-debug.py stages the module and only produces compile records, so it skips
+# both; the archive step stages the module and the final pass applies them.
+if [ "${XNU_NATIVE_USB_DEBUG:-0}" = 1 ] && [ "${XNU_BOOTSTRAP:-0}" != 1 ]; then
+  QUD_PATCHER=$ROOT/.cache/fuxi-qud-module/scripts/xnu_patches.py
+  if [ ! -f "$QUD_PATCHER" ]; then
+    echo 'QcomXnuUsbDebug module not staged; run build-fuxi-usb-debug.py first' >&2
+    exit 1
+  fi
+  QUD_STATE=$(python3 "$QUD_PATCHER" status --xnu "$ROOT/.cache/xnu-work" --profile darwin23-fuxi)
+  if [[ "$QUD_STATE" == *'"state_before": "ready"'* ]]; then
+    python3 "$QUD_PATCHER" check --xnu "$ROOT/.cache/xnu-work" --profile darwin23-fuxi
+    python3 "$QUD_PATCHER" apply --xnu "$ROOT/.cache/xnu-work" --profile darwin23-fuxi
+  elif [[ "$QUD_STATE" != *'"state_before": "applied"'* ]]; then
+    echo 'USB source integration is not ready: '"$QUD_STATE" >&2
+    exit 1
+  fi
+  if [ -f "$ROOT/scripts/fuxi-usb-boot-progress.py" ]; then
+    python3 "$ROOT/scripts/fuxi-usb-boot-progress.py" "$ROOT/.cache/xnu-work"
+  fi
 fi
 export XNU_AVAILABILITY_PL=$ROOT/.cache/fakeroot/usr/local/libexec/availability.pl
 python3 scripts/prepare-xnu-source.py
@@ -817,6 +845,23 @@ if not stamp.exists() or stamp.read_text() != identity:
     stamp.write_text(identity)
 PY
 EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_BOOT_PROGRESS=$BOOT_PROGRESS"
+# QcomXnuUsbDebug: turn on the console/bsd USB call sites and give its six units the staged headers.
+# Every previously selected per-object option is preserved; the flags are only appended.
+if [ "${XNU_NATIVE_USB_DEBUG:-0}" = 1 ]; then
+  for qud_object in pe_kprintf.o debug.o printf.o serial_console.o serial_general.o bsd_init.o; do
+    qud_key="${qud_object}_CFLAGS_ADD="
+    qud_found=0
+    for qud_index in "${!EXTRA_MAKE_ARGS[@]}"; do
+      if [[ "${EXTRA_MAKE_ARGS[$qud_index]}" == "$qud_key"* ]]; then
+        EXTRA_MAKE_ARGS[$qud_index]="${EXTRA_MAKE_ARGS[$qud_index]} -DXNU_QCOM_USB_DEBUG=1 -I$ROOT/.cache/fuxi-qud-module/include"
+        qud_found=1
+      fi
+    done
+    if [ "$qud_found" = 0 ]; then
+      EXTRA_MAKE_ARGS+=("${qud_key}-DXNU_QCOM_USB_DEBUG=1 -I$ROOT/.cache/fuxi-qud-module/include")
+    fi
+  done
+fi
 make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iphoneos}" ARCH_CONFIGS=ARM64 \
   MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT \
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG="$XNU_ARCH_STRING" LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY \
