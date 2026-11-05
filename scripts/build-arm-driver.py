@@ -108,7 +108,7 @@ if component == 'NativeAdreno':
 result = subprocess.run(command, cwd=record['directory'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 (out / 'compile.log').write_text(result.stdout)
 if result.returncode:
-    raise SystemExit(result.stdout[-3500:])
+    raise SystemExit(result.stdout if len(result.stdout) <= 10000 else result.stdout[:6500] + '\n... full diagnostics in compile.log ...\n' + result.stdout[-3500:])
 check_object(destination.read_bytes(), component)
 archive = out / ('lib' + identifier + '.a')
 archive.unlink(missing_ok=True)
