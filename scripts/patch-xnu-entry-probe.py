@@ -293,6 +293,19 @@ def assemble_c(source, va, workdir, symbols):
         if not any(base <= text and text + 256 <= base + size for base, size, _, _ in SEGMENTS):
             raise SystemExit('Invalid _boot_progress_panic_text')
         definitions.append(f'-DPANIC_TEXT={text:#x}UL')
+    # Optional: the QcomXnuUsbDebug status provider. Kernels without the USB archive get 0 (status row skipped).
+    qud = symbols.get('_qcom_usb_debug_get_status')
+    if qud is not None:
+        if not any(base <= qud and qud + 4 <= base + size for base, size, _, _ in SEGMENTS):
+            raise SystemExit('Invalid _qcom_usb_debug_get_status')
+        definitions.append(f'-DQUD_STATUS={qud:#x}UL')
+    # The page background colour the USB adapter derives from the CDC phase. Computing it in the
+    # adapter keeps the colour logic out of the panic screen's padding budget.
+    bg = symbols.get('_native_usb_panic_bg')
+    if bg is not None:
+        if not any(base <= bg and bg + 4 <= base + size for base, size, _, _ in SEGMENTS):
+            raise SystemExit('Invalid _native_usb_panic_bg')
+        definitions.append(f'-DQUD_BG={bg:#x}UL')
     subprocess.run([clang, '--target=aarch64-none-elf', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
                     '-mgeneral-regs-only', '-fno-pic', '-mcmodel=tiny', '-Oz', f'-DVINFO={VINFO_VA:#x}UL',
                     *definitions, f'-I{font_dir}', '-c', source, '-o', obj], check=True)

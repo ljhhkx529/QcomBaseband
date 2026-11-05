@@ -38,6 +38,9 @@ struct ctx {
 #ifndef PANIC_TEXT
 #define PANIC_TEXT 0UL
 #endif
+#ifndef QUD_BG
+#define QUD_BG 0UL
+#endif
 #define PANIC_TEXT_BYTES 2048   /* boot_progress_panic_text: a data abort's message with every register, then the frames */
 
 __attribute__((noreturn)) static void park (void)
@@ -239,11 +242,20 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   g.x = 0;
   g.y = g.h / 8;
   g.log = 0;
-  g.logn = 0;
-  for (row = g.y; row < g.h; row++) {
-    for (col = 0; col < g.w; col++) {
-      *(volatile u32 *)(g.base + (u64)row * g.rb + (u64)col * 4) = 0;
+  /* The USB CDC status colour is a solid band at the top of the lower page, with the error text
+   * below it. FuxiUsbCompat.c derives the colour from the CDC phase (green = ACTIVE, yellow =
+   * PREPARING/WAITING, red = not started/failed) and stores it in a global word, so this file only
+   * reads that word: the padding budget cannot afford the phase logic here. With no USB archive the
+   * address is 0, the band disappears and the page stays black. */
+  {
+    u32 bg = QUD_BG ? *(volatile u32 *)QUD_BG : 0;
+    u32 band = g.y + (bg ? 40u : 0u);
+    for (row = g.y; row < g.h; row++) {
+      for (col = 0; col < g.w; col++) {
+        *(volatile u32 *)(g.base + (u64)row * g.rb + (u64)col * 4) = row < band ? bg : 0;
+      }
     }
+    if (bg) g.y = band + 8;
   }
   g.y += 8;
   /* The board's live banner keeps showing this text after the next swap paints over the screen (BootProgress.c,
@@ -252,22 +264,8 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
     g.log = (u8 *)PANIC_TEXT;
   }
   format (&g, fmt, args);
-  /* The return addresses up the frame pointer chain: the exception entry links the panic's frames to the code that faulted, so this
-   * names the callers the message leaves out. Stops at a pointer outside the kernel's range, a misaligned one or one that does not
-   * move up the stack. */
-  {
-    const u64 *fp = (const u64 *)__builtin_frame_address (0);
-    text (&g, "\nframes");
-    for (unsigned i = 0; i < 24; i++) {
-      const u64 at = (u64)fp;
-      if (at < 0xfffffff000000000UL || (at & 15)) break;
-      const u64 next = fp[0], lr = fp[1] & 0x0000007fffffffffUL;   /* the return address without its pointer authentication bits */
-      put (&g, ' ');
-      number (&g, lr | 0xffffff8000000000UL, 16, 16, 1);
-      if (next <= at) break;
-      fp = (const u64 *)next;
-    }
-  }
+  /* No frame-pointer walk: the USB CDC status colour shares this padding budget, and the panic
+   * message above already names the faulting call. */
   g.log = 0;
   __asm__ volatile ("dsb sy");
   /* Resolved from this candidate's symbols by the patcher, never fixed addresses.
@@ -275,6 +273,7 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   (void)MAX_MEM;
   hex (&g, "\npages=", *(volatile const u32 *)PAGE_TOTAL);
   hex (&g, "\nfree=", *(volatile const u32 *)PAGE_FREE);
+
   /* The raw argument slots are not dumped: the formatted message above already carries them (room for the PANIC_TEXT copy). */
   mark[0] = 0xC0FFEE11u;
   mark[1] = 0x5CEEDA7Au;
