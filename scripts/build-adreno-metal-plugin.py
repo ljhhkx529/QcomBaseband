@@ -28,6 +28,10 @@ if OUT.exists():
 bundle.mkdir(parents=True)
 sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
 base = ['xcrun', 'clang', '-target', 'arm64e-apple-ios27.0' if IOS27 else 'arm64-apple-ios17.0', '-isysroot', sdk, '-O2', '-g', '-Wall', '-Wextra', '-Werror',
+        # patchFramebufferBranch is called only inside the arm64e block, so on the arm64 build of this same source it
+        # has no caller. The function is correct for the target that uses it; the arm64 translation unit simply does
+        # not reach it.
+        '-Wno-unused-function',
         '-fstack-protector-strong']
 VULKAN_INCLUDE = ROOT / '.cache/mesa-work/include'
 TURNIP = ROOT / ('build/mesa-tu-ios27' if IOS27 else 'build/mesa-tu-ios') / 'src/freedreno/vulkan/libvulkan_freedreno.dylib'
