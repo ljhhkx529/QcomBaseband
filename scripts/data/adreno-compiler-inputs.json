@@ -50,6 +50,7 @@
     "patches/mesa/ir3-portable-asm-roundtrip.patch",
     "patches/mesa/offline-adreno-compiler-probe.patch",
     "patches/mesa/turnip-darwin-kmd.patch",
+    "patches/mesa/turnip-darwin-command-policy.patch",
     "patches/mesa/turnip-graphics-cache-feedback.patch",
     "patches/mesa/turnip-empty-scissor.patch",
     "patches/mesa/turnip-builtin-shader-pack.patch",

@@ -1,0 +1,233 @@
+From: fuxi GPU bring-up <noreply@example.com>
+Subject: [PATCH] Turnip: honour the kernel's command-stream capabilities
+
+The Darwin kernel backend publishes two facts about the command processor it talks to, in the same
+device-info flags word it already uses for the client-IoVA and coherent-memory bits:
+
+  bit 2  the command processor accepts only the BR render thread
+  bit 3  the command processor stops on CP_WAIT_MEM_WRITES
+
+Where a kernel sets neither, every command stream is emitted exactly as before: each change below is
+gated on the bit, and the default path is unchanged byte for byte.
+
+  - tu_cs_emit_pkt7(): a zero-payload CP_WAIT_MEM_WRITES becomes a zero-payload CP_NOP, the same header
+    encoding, which is why the substitution is legal.
+  - tu_thread_control_payload(): the one place a CP_THREAD_CONTROL payload is built. Such a device gets
+    the BR form with concurrent binning disabled, and never SYNC_THREADS (it would wait for a thread
+    that is not running); every other device gets exactly the word its caller asked for.
+  - every site that built a payload itself now goes through that place: tu7_thread_control, the
+    simultaneous-use case in tu_CmdExecuteCommands, the occlusion-query predicate in tu_query_pool, the
+    binning branch in tu_cmd_buffer and the LRZ emitter in tu_lrz — the last three only run in tiled mode.
+  - tu7_set_thread_both_patchpoint(): there is no second thread to return to, so it emits the BR form
+    and records no concurrent-binning control point, which would otherwise put BOTH back into the stream
+    after this file emitted BR.
+
+All of it follows from capabilities the kernel reports: nothing here names a board.
+
+---
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index bc779a7..2a8a639 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -457,6 +457,11 @@ tu7_set_thread_br_patchpoint(struct tu_cmd_buffer *cmd,
+                              struct tu_cs *cs,
+                              bool force_disable_cb)
+ {
++   /* A device that accepts only the BR render thread never has concurrent binning to switch on, so the
++    * patchpoint is left out and nothing later rewrites this word back to BOTH. */
++   if (tu_command_policy_single_render_thread(cmd->device))
++      force_disable_cb = true;
++
+    tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+ 
+    if (!force_disable_cb) {
+@@ -478,6 +483,13 @@ void
+ tu7_set_thread_both_patchpoint(struct tu_cmd_buffer *cmd,
+                                struct tu_cs *cs)
+ {
++   /* The same for the BOTH patchpoint: on such a device the stream stays on BR and there is no control
++    * point to record, because there is no second thread to return to. */
++   if (tu_command_policy_single_render_thread(cmd->device)) {
++      tu7_set_thread_br_patchpoint(cmd, cs, true);
++      return;
++   }
++
+    tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+ 
+    struct tu_cb_control_point info = {
+@@ -514,8 +526,7 @@ tu_emit_cache_flush(struct tu_cmd_buffer *cmd_buffer)
+        */
+       struct tu_cs_patchable_state cb_state = tu_cs_patchable_start(cs, 64);
+ 
+-      tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+-      tu_cs_emit(cs, CP_THREAD_CONTROL_0_THREAD(CP_SET_THREAD_BOTH));
++      tu7_thread_control(cs, CP_SET_THREAD_BOTH);
+ 
+       tu_cs_emit_pkt7(cs, CP_MODIFY_TIMESTAMP, 1);
+       tu_cs_emit(cs, CP_MODIFY_TIMESTAMP_0_ADD(1) |
+@@ -3636,7 +3647,7 @@ tu6_tile_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+ 
+          if (use_binning) {
+             tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+-            tu_cs_emit(cs, CP_THREAD_CONTROL_0_THREAD(CP_SET_THREAD_BV));
++            tu_cs_emit(cs, tu_thread_control_payload(cs, CP_SET_THREAD_BV, false));
+ 
+             tu_lrz_after_bv<CHIP>(cmd, cs);
+ 
+@@ -6629,8 +6640,7 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+             /* Make BV wait for updates on BR to land */
+             if (cmd->device->physical_device->info->chip >= 7) {
+                tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+-               tu_cs_emit(cs, CP_THREAD_CONTROL_0_THREAD(CP_SET_THREAD_BR) |
+-                              CP_THREAD_CONTROL_0_SYNC_THREADS);
++               tu_cs_emit(cs, tu_thread_control_payload(cs, CP_SET_THREAD_BR, true));
+             }
+          }
+ 
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index 47e1939..9de21f1 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -18,6 +18,22 @@ tu_sanitize_ib_size(uint32_t size)
+    return MIN2(size, 0x0fffff);
+ }
+ 
++/* NativeAdrenoDeviceSingleRenderThread: the command processor accepts only the BR render thread. */
++bool
++tu_command_policy_single_render_thread(struct tu_device *device)
++{
++   return device && device->physical_device &&
++          (device->physical_device->command_policy_flags & (1u << 2));
++}
++
++/* NativeAdrenoDeviceNoWaitMemWrites: the command processor stops on CP_WAIT_MEM_WRITES. */
++bool
++tu_command_policy_no_wait_mem_writes(struct tu_device *device)
++{
++   return device && device->physical_device &&
++          (device->physical_device->command_policy_flags & (1u << 3));
++}
++
+ /**
+  * Initialize a command stream.
+  */
+diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
+index 6a66de1..68fc27b 100644
+--- a/src/freedreno/vulkan/tu_cs.h
++++ b/src/freedreno/vulkan/tu_cs.h
+@@ -126,6 +126,14 @@ tu_breadcrumbs_init(struct tu_device *device);
+ void
+ tu_breadcrumbs_finish(struct tu_device *device);
+ 
++/* Command-stream capabilities the kernel published for this device (NativeAdrenoDevice* bits 2 and 3). Read
++ * only for the two packet kinds they change, so the emit path costs nothing else. */
++bool
++tu_command_policy_single_render_thread(struct tu_device *device);
++
++bool
++tu_command_policy_no_wait_mem_writes(struct tu_device *device);
++
+ void
+ tu_cs_init(struct tu_cs *cs,
+            struct tu_device *device,
+@@ -350,6 +358,14 @@ tu_cs_emit_pkt7(struct tu_cs *cs, uint8_t opcode, uint16_t cnt)
+    tu_cs_emit_sync_breadcrumb(cs, opcode, cnt + 1);
+ #endif
+ 
++   /* A zero-payload CP_WAIT_MEM_WRITES is a barrier this device never finishes, and its encoding is exactly a
++    * legal zero-payload CP_NOP; only that shape is substituted, and only when the kernel says so. */
++   if (opcode == CP_WAIT_MEM_WRITES && cnt == 0 &&
++       tu_command_policy_no_wait_mem_writes(cs->device)) {
++      tu_cs_reserve(cs, 1);
++      tu_cs_emit(cs, pm4_pkt7_hdr(CP_NOP, 0));
++      return;
++   }
+    tu_cs_reserve(cs, cnt + 1);
+    tu_cs_emit(cs, pm4_pkt7_hdr(opcode, cnt));
+ }
+@@ -534,11 +550,27 @@ tu_cond_exec_end(struct tu_cs *cs)
+    }
+ }
+ 
++/* The payload word of a CP_THREAD_CONTROL, as this device can take it: a device that reports only the BR
++ * render thread never gets any other selection, and never gets SYNC_THREADS either (it would wait for a thread
++ * that is not running). Every other device gets exactly the word its caller asked for. */
++static inline uint32_t
++tu_thread_control_payload(struct tu_cs *cs, enum cp_thread thread, bool sync)
++{
++   if (tu_command_policy_single_render_thread(cs->device)) {
++      /* One render thread means there is no concurrent binning to switch to, so the word says so as well:
++       * the command processor then has nothing left to infer from the stream. */
++      return CP_THREAD_CONTROL_0_THREAD(CP_SET_THREAD_BR) |
++             CP_THREAD_CONTROL_0_CONCURRENT_BIN_DISABLE;
++   }
++   return CP_THREAD_CONTROL_0_THREAD(thread) |
++          (sync ? CP_THREAD_CONTROL_0_SYNC_THREADS : 0);
++}
++
+ static inline void
+ tu7_thread_control(struct tu_cs *cs, enum cp_thread thread)
+ {
+    tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+-   tu_cs_emit(cs, CP_THREAD_CONTROL_0_THREAD(thread));
++   tu_cs_emit(cs, tu_thread_control_payload(cs, thread, false));
+ }
+ 
+ static inline void
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index 356ab86..36bdb24 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -173,6 +173,11 @@ struct tu_physical_device
+    struct fd_dev_info dev_info;
+    const struct fd_dev_info *info;
+ 
++   /* Command-stream capabilities the kernel published (NativeAdrenoDevice*): bit 2 the command processor
++    * accepts only the BR render thread, bit 3 it stops on CP_WAIT_MEM_WRITES. Zero on every other board,
++    * where the command stream is then emitted exactly as before. */
++   uint32_t command_policy_flags;
++
+    int msm_major_version;
+    int msm_minor_version;
+ 
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index c12bd00..c00025a 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -1686,6 +1686,10 @@ tu_knl_darwin_load(struct tu_instance *instance)
+ 
+    const NativeAdrenoAbiDeviceInfo *info = &dw.info;
+ 
++   /* Bits 2 and 3 of the info flags: this kernel's command processor accepts only the BR render thread and
++    * stops on CP_WAIT_MEM_WRITES, so the command stream has to respect that (see tu_cs.h). */
++   device->command_policy_flags = info->flags & ((1u << 2) | (1u << 3));
++
+    device->instance = instance;
+    device->local_fd = -1;
+    device->master_fd = -1;
+diff --git a/src/freedreno/vulkan/tu_lrz.cc b/src/freedreno/vulkan/tu_lrz.cc
+index 1daad1e..10054f2 100644
+--- a/src/freedreno/vulkan/tu_lrz.cc
++++ b/src/freedreno/vulkan/tu_lrz.cc
+@@ -918,7 +918,7 @@ tu_disable_lrz(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                      CP_MODIFY_TIMESTAMP_0_OP(MODIFY_TIMESTAMP_ADD_LOCAL));
+ 
+       tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+-      tu_cs_emit(cs, CP_THREAD_CONTROL_0_THREAD(CP_SET_THREAD_BV));
++      tu_cs_emit(cs, tu_thread_control_payload(cs, CP_SET_THREAD_BV, false));
+ 
+       tu7_wait_onchip_val(cs, TU_ONCHIP_CB_RESLIST_OVERFLOW, 0);
+ 
+diff --git a/src/freedreno/vulkan/tu_query_pool.cc b/src/freedreno/vulkan/tu_query_pool.cc
+index 7c30e65..be75753 100644
+--- a/src/freedreno/vulkan/tu_query_pool.cc
++++ b/src/freedreno/vulkan/tu_query_pool.cc
+@@ -1150,7 +1150,7 @@ emit_begin_stat_query(struct tu_cmd_buffer *cmdbuf,
+           */
+          if (!cmdbuf->state.pass) {
+             tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+-            tu_cs_emit(cs, CP_THREAD_CONTROL_0_THREAD(CP_SET_THREAD_BOTH));
++            tu_cs_emit(cs, tu_thread_control_payload(cs, CP_SET_THREAD_BOTH, false));
+          }
+          tu7_set_pred_mask(cs, (1u << TU_PREDICATE_VTX_STATS_RUNNING) |
+                                (1u << TU_PREDICATE_VTX_STATS_NOT_RUNNING),
