@@ -25,6 +25,12 @@ for name in ['IOKit/IOTypes.h', 'IOKit/IOReturn.h', 'IOKit/IOBufferMemoryDescrip
     path = includes / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('#include "XnuMemoryFixture.h"\n')
+resource_private = includes / 'sys/resource_private.h'
+resource_private.parent.mkdir(parents=True, exist_ok=True)
+resource_private.write_text(
+    '#include "XnuMemoryFixture.h"\n'
+    '#define PRIO_DARWIN_GPU_BACKGROUND 8\n'
+    '#define PRIO_DARWIN_GPU_UTILITY 9\n')
 
 objects = []
 for stem in ['ArmSmmu4KContext', 'ArmSmmu4KProgram', 'ArmSmmu4KLive', 'ArmSmmu4KStreams', 'ArmSmmu4KMmio']:
@@ -39,12 +45,16 @@ service = out / 'host_gpu_service.o'
 subprocess.run(['xcrun', 'clang++', '-std=c++23', '-O1', '-fPIC', '-I', includes, '-I', sim.parent, '-I', kit, '-I', smmu,
                 '-I', ROOT / 'kits/AdrenoPM4', '-c', sim / 'host_gpu_service.cpp', '-o', service], check=True)
 core = []
-for name in ['NativeAdrenoMemory', 'NativeAdrenoSmmuMemory', 'NativeAdrenoVm', 'NativeAdrenoRing', 'NativeAdrenoSubmit',
+for name in ['NativeAdrenoMemory', 'NativeAdrenoSmmuMemory', 'NativeAdrenoVm', 'NativeAdrenoPreempt', 'NativeAdrenoRing', 'NativeAdrenoSubmit',
              'NativeAdrenoUserClient', 'NativeAdrenoTimer', 'NativeAdrenoSmmuContext', 'NativeAdrenoGpuContext']:
     obj = out / (name + '.o')
     subprocess.run(['xcrun', 'clang++', '-std=c++23', '-O1', '-fPIC', '-I', includes, '-I', sim.parent, '-I', kit, '-I', smmu,
                     '-I', ROOT / 'kits/AdrenoPM4', '-c', kit / (name + '.cpp'), '-o', obj], check=True)
     core.append(obj)
+hooks = out / 'HostKernelHooks.o'
+subprocess.run(['xcrun', 'clang++', '-std=c++23', '-O1', '-fPIC', '-I', includes, '-I', sim.parent, '-I', kit,
+                '-c', kit / 'tests/HostKernelHooks.cpp', '-o', hooks], check=True)
+core.append(hooks)
 shim_obj = out / 'host_iokit_shim.o'
 subprocess.run(['xcrun', 'clang++', '-std=c++17', '-O1', '-fPIC', '-c', sim / 'host_iokit_shim.cpp', '-o', shim_obj], check=True)
 shim = out / 'libhostiokit.dylib'

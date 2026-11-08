@@ -24,19 +24,18 @@ if subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text
     raise SystemExit('Translator revision differs from the qualified source pin')
 PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
     # Each stacks on the source the ones before it leave.
-    '0001-optional-constant-output-members.patch', '0002-resource-wait-storage-dependencies.patch',
+    '0002-resource-wait-storage-dependencies.patch',
     '0003-cache-device-entry-point-priming.patch', '0004-fold-constant-global-field-loads.patch',
     # A draw whose pipeline the driver refused binds nothing (int-170: tu_CmdBindPipeline in the render server).
     '0005-skip-draws-without-a-pipeline.patch',
     # A batch's barrier globals on the stack, and the neutral resources' maps by the runtime's key hash.
     '0006-batch-barriers-and-key-hash-neutral-maps.patch',
-    # From the DroidVM board's translator patches: a cache directory a sandboxed process may not write, llvm.bitreverse, a patch
-    # function with no control points, and Core Image kernel libraries (file_type 1) loaded as Metal loads them.
-    '0007-optional-shader-cache-directory.patch', '0008-llvm-bitreverse.patch', '0009-patch-with-no-control-points.patch',
-    '0010-core-image-kernel-libraries.patch',
+    # From the DroidVM board's translator patches: a cache directory a sandboxed process may not write and a patch
+    # function with no control points. The newer translator contains the bitreverse and Core Image support upstream.
+    '0007-optional-shader-cache-directory.patch', '0009-patch-with-no-control-points.patch',
     # A two-plane surface's shadow starts as its memory lies; the Astronomy wallpaper's extended-range sRGB blends take the rounded
     # model; pooled blocks start at 4 MiB and grow (the render server alone held 1 GiB of wired memory).
-    '0011-two-plane-shadow-as-memory-lies.patch', '0012-srgb-extended-range-blend-rounded-model.patch',
+    '0011-two-plane-shadow-as-memory-lies.patch',
     '0013-growing-memory-blocks.patch',
     # HostPageTexturePolicy::InPlaceWrites: textures over surfaces and padded buffers are images over their bytes, rendered and written
     # too, where their tile stores stay within their rows, instead of shadows copied in and out every pass.
@@ -65,7 +64,10 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
     '0023-quality-of-service-on-ios.patch',
     # The host's diagnostics switch (SHENG_DIAG, from the boot argument sheng-diag=1): without it the stage ring and the allocation sites
     # keep nothing. The stage ring also marks the steps inside a batch's submission (SubmitStep: placed, gathered, vkQueueSubmit, changes).
-    '0024-diagnostics-switch-and-submit-steps.patch']]
+    '0024-diagnostics-switch-and-submit-steps.patch',
+    '0025-specialized-links-shared-constants-and-allocation-size.patch',
+    '0026-frame-diagnostic-links.patch', '0027-bounded-image-reuse.patch',
+    '0029-latency-stage-selection.patch', '0030-spare-image-blocks-give-room.patch']]
 
 
 def git_tree(*steps):
@@ -121,11 +123,12 @@ if args.manifest_only:
     raise SystemExit(0)
 triple = {'ios': 'aarch64-apple-ios', 'ios27': 'arm64e-apple-ios', 'host': 'aarch64-apple-darwin'}[args.target]
 # arm64e has no prebuilt std: it is built from rust-src (RUSTC_BOOTSTRAP for -Z); the iPadOS 27 processes that load the plugin are arm64e.
-cargo = ['cargo', '+1.98.0'] + (['-Z', 'build-std=std,panic_unwind'] if args.target == 'ios27' else [])
+cargo = ['rustup', 'run', '1.98.0', 'cargo'] + (['-Z', 'build-std=std,panic_unwind'] if args.target == 'ios27' else [])
 # The translator source the runtime is built from (its pin and recorded patches), which keys the shader cache: shader priming keeps what it
 # finished while this stays the same (PrimeShaders.h).
 runtime_id = hashlib.sha256((PIN + '\n' + states[-1]).encode()).hexdigest()[:32]
 env = dict(os.environ, NMB_RUNTIME_ID=runtime_id, NMB_FIXTURE_AIR=str(air), NMB_FC_AIR=str(fc_air), NMB_SCANOUT_AIR=str(scanout_air), IPHONEOS_DEPLOYMENT_TARGET='27.0' if args.target == 'ios27' else '17.0', MACOSX_DEPLOYMENT_TARGET='14.0')
+env['RUSTC'] = subprocess.check_output(['rustup', 'which', '--toolchain', '1.98.0', 'rustc'], text=True).strip()
 if args.target == 'ios27':
     env['RUSTC_BOOTSTRAP'] = '1'
 target_dir = ROOT / 'build/m2v-target'
