@@ -83,9 +83,10 @@ kind = "driver"
 function = "A740 kernel GPU driver"
 scope = "gpu"
 repository = "https://github.com/UniXNU/Adreno740.git"
-# fuxi bring-up overlay rebased on upstream 6fa7bae2a5b3b523e790eb3e0348af4d98969e4d:
-# keep the two-dword CP_SMMU_TABLE_UPDATE, process-table read-back, kernel-table mount and thread-control fixes.
-revision = "a9a2cbb43b89d672e2921e19721a6438b738b17f"
+# fuxi bring-up overlay on upstream 6fa7bae2a5b3b523e790eb3e0348af4d98969e4d: it keeps the two-dword
+# CP_SMMU_TABLE_UPDATE, the process-table read-back and the mount policy, and nothing else: the command-stream
+# corrections the bring-up needed are deleted, so the runtime decides what to emit.
+revision = "2c838c924490cf7663a0767805f6c78ffaeda78c"
 path = "drivers/Adreno740"
 hardware = ["Adreno 740", "SM8550"]
 os_abi = ["ipados-17.7.11-21H461"]
