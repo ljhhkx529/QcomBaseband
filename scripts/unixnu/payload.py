@@ -39,18 +39,37 @@ def check_args(arguments):
 
 
 def check_data_input(ctx, data):
-    """An owner-Data kernel needs a seed even when it resumes a persistent overlay."""
-    if data:
-        return
+    """An owner-Data kernel needs the exact seed its compiled UUID selects.
+
+    Persistent storage does not make the seed interchangeable: the native block
+    provider publishes the APFS volume by the UUID compiled into the kernel.  For
+    packed DBRDISK1 inputs the UUID is available without mounting the image, so
+    reject a mismatched kernel/seed pair before writing the payload.
+    """
     from .config import parse_config
     config = ctx.config
     if not ctx.config_path.is_file() and ctx.config_name:
         selected = ctx.device / 'configs' / ctx.config_name
         if selected.is_file():
             config = parse_config(selected.read_text())
-    if config.get('XNU_OWNER_DATA_MOUNT'):
+    if not config.get('XNU_OWNER_DATA_MOUNT'):
+        return None
+    if not data:
         raise Error('CONFIG_XNU_OWNER_DATA_MOUNT requires --data-ramdisk FILE (or [build] data_ramdisk); '
                     'persistent Data still needs its original seed to publish the volume')
+    path = expand(data)
+    if not path.is_file():
+        return None  # build() reports the missing path with its existing diagnostic.
+    packed = ctx.board.get('payload', {}).get('adt', {}).get('packed_data_ramdisk', False)
+    expected = config.get('XNU_OWNER_DATA_VOLUME_UUID')
+    if not packed or not expected:
+        return None
+    from .runtime import seed_uuid
+    observed = seed_uuid(ctx.tree, path)
+    if observed != expected:
+        raise Error(f'Data seed UUID {observed} differs from compiled CONFIG_XNU_OWNER_DATA_VOLUME_UUID '
+                    f'{expected}; use the preserved matching seed or rebuild the kernel for this seed')
+    return observed
 
 
 def check_native_root(kernel, arguments, vmm_present=False):
@@ -71,6 +90,20 @@ def check_native_root(kernel, arguments, vmm_present=False):
     symbols = run([tool('llvm-nm', 'brew install llvm'), '--defined-only', kernel], capture=True)
     if not any(line.split()[-1:] == ['_sheng_pmgr_run'] for line in symbols.splitlines()):
         raise Error('the native UFS root kernel lacks the linked sheng PMGR integration')
+
+
+def check_gpu_addon_input(arguments, addon, owner_trust):
+    """Do not silently build a GPU-enabled command line without its user-space payload.
+
+    The kernel-side Adreno bring-up can still retire its self-test fences when the addon is absent.  That makes a bad image look
+    healthy until SpringBoard asks for Metal.  Treat the boot argument as an input contract so a payload with the plugin or its
+    owner trust cache omitted never reaches bootimg.
+    """
+    enabled = any(argument == 'sheng-gpu-addon=1' for argument in arguments)
+    if enabled and not addon:
+        raise Error('sheng-gpu-addon=1 requires --gpu-addon FILE; refusing a kernel-only GPU payload with no Metal plugin')
+    if enabled and not owner_trust:
+        raise Error('sheng-gpu-addon=1 requires --owner-trust-cache FILE containing the Metal plugin trust cache')
 
 
 def write_volume(stage, image, label, size_mib):
@@ -126,7 +159,7 @@ def build(ctx, kernel=None):
         if allowed and not owner_trust and sha256_file(trust) not in allowed:
             raise Error(f'{trust} is not one of the trust caches this board accepts (board.toml [payload] trust_cache_sha256)')
     data = expand(args.data_ramdisk) if getattr(args, 'data_ramdisk', None) else None
-    check_data_input(ctx, data)
+    data_uuid = check_data_input(ctx, data)
     if data and not data.is_file():
         raise Error(f'Data ramdisk not found: {data}')
     if getattr(args, 'skip_setup', False):
@@ -138,6 +171,7 @@ def build(ctx, kernel=None):
     addon = expand(args.gpu_addon) if getattr(args, 'gpu_addon', None) else None
     if addon and (not addon.is_file() or addon.read_bytes()[:8] != b'NGPUADD2'):
         raise Error(f'GPU addon not found or not made by scripts/make-gpu-addon.py: {addon}')
+    check_gpu_addon_input(arguments, addon, owner_trust)
     policy_path = spec.get('root_policies')
     policies = expand(policy_path.format(tree=ctx.tree, out=ctx.work)) if policy_path else None
     if policies:
@@ -252,7 +286,8 @@ def build(ctx, kernel=None):
     data_report = {'kernel_sha256': sha256_file(kernel), 'payload_kernel_sha256': sha256_file(payloads / 'kernel.macho'),
                    'adt_sha256': sha256_file(payloads / 'kernel.macho.adt'), 'kernel_args': line,
                    'trust_cache_sha256': sha256_file(trust) if trust else None, 'gpu_addon_sha256': sha256_file(addon) if addon else None,
-                   'data_ramdisk_sha256': sha256_file(data) if data else None, 'skip_setup': bool(getattr(args, 'skip_setup', False)), 'panic_screen': bool(spec.get('panic_screen')),
+                   'data_ramdisk_sha256': sha256_file(data) if data else None, 'data_volume_uuid': data_uuid,
+                   'skip_setup': bool(getattr(args, 'skip_setup', False)), 'panic_screen': bool(spec.get('panic_screen')),
                    'payload_sha256': sha256_file(image), 'payload_bytes': image.stat().st_size, 'hardware_tested': False}
     report.write_text(json.dumps(data_report, indent=2) + '\n')
     shutil.rmtree(stage)

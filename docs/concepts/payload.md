@@ -101,6 +101,10 @@ The bundle is copied into the kernel window and its address and size replace the
 
 An `--owner-trust-cache` bundle is copied without the `[payload] trust_cache_sha256` check. It carries the original caches and extra modules such as the GPU plugin.
 
+When the effective kernel command line contains `sheng-gpu-addon=1`, both `--gpu-addon` and `--owner-trust-cache` are mandatory.
+The payload build fails if either is missing. Kernel-side Adreno self-tests can otherwise pass while the user-space Metal plugin is
+absent, producing a deceptively bootable image with no usable Metal path.
+
 ## Data ramdisk
 
 When the selected kernel configuration enables `CONFIG_XNU_OWNER_DATA_MOUNT`,
@@ -118,6 +122,11 @@ A Data seed can be delivered in two forms:
 | Packed | `PackedRAMDisk` | DarwinBoot validates the `DBRDISK1` extent table and copies the extents |
 
 The packed form carries a header with the magic `DBRDISK1`, version 1, the page size, the expanded size and an extent table of `(offset, length)` pairs. Omitted ranges are zeroed RAM.
+
+When `CONFIG_XNU_OWNER_DATA_MOUNT` and `[payload.adt] packed_data_ramdisk` are enabled,
+the payload builder also reads the APFS volume UUID from the packed seed. It refuses to
+write a payload when that UUID differs from `CONFIG_XNU_OWNER_DATA_VOLUME_UUID`; a
+persistent overlay still has to be published through the preserved matching seed.
 
 `scripts/seed-data-grow.py` grows a packed seed to the tablet's storage. The kernel accepts a Data disk of up to 1 TiB, and above 2 GiB the typed provider keeps only the nonzero pages of the seed.
 

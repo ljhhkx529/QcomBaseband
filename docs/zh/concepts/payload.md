@@ -106,6 +106,10 @@ DarwinBoot 校验 trust cache 包：
 
 `--owner-trust-cache` 包不经过 `[payload] trust_cache_sha256` 校验。它携带原始缓存和 GPU 插件等额外模块。
 
+当最终内核命令行包含 `sheng-gpu-addon=1` 时，必须同时提供 `--gpu-addon` 和 `--owner-trust-cache`，缺少任意一项都会让
+payload 构建直接失败。否则内核侧 Adreno 自检仍可能通过，但用户态 Metal 插件并不存在，从而生成一个看似能启动、实际没有
+可用 Metal 路径的镜像。
+
 ## Data ramdisk
 
 Data 种子有两种交付形式：
@@ -116,6 +120,11 @@ Data 种子有两种交付形式：
 | Packed | `PackedRAMDisk` | DarwinBoot 校验 `DBRDISK1` extent 表并复制片段 |
 
 Packed 形式包含 magic `DBRDISK1`、版本 1、页大小、展开大小和 `(offset, length)` extent 表。未列出的范围是零填充 RAM。
+
+启用 `CONFIG_XNU_OWNER_DATA_MOUNT` 和 `[payload.adt] packed_data_ramdisk` 时，
+payload 构建器还会读取 packed seed 内的 APFS 卷 UUID。若它与
+`CONFIG_XNU_OWNER_DATA_VOLUME_UUID` 不同，构建会在写入 payload 前失败；即使使用持久化
+overlay，也必须继续提供与内核匹配的原始 seed 来发布该卷。
 
 `scripts/seed-data-grow.py` 把 packed 种子增长到平板的存储大小。内核接受最大 1 TiB 的 Data 磁盘，超过 2 GiB 时 typed provider 只保存种子的非零页。
 

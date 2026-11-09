@@ -13,16 +13,17 @@ from unittest.mock import patch
 from unixnu.config import parse_config
 from unixnu.kernel import check_prelink_regressions
 from unixnu import runtime
+from unixnu.payload import check_data_input, check_gpu_addon_input
 from unixnu.util import Error
 
 ROOT = Path(__file__).resolve().parents[1]
 IDENTITY = '2A5E9027-D9E1-40F9-983C-41BD3F1994F5'
 
 
-def seed(path):
+def seed(path, identity=IDENTITY):
     block = bytearray(4096)
     block[32:36] = b'APSB'
-    block[240:256] = uuid.UUID(IDENTITY).bytes
+    block[240:256] = uuid.UUID(identity).bytes
     path.write_bytes(struct.pack('<8sIIQQ', b'DBRDISK1', 1, 4096, 4096, 1) + struct.pack('<QQ', 0, 4096) + block)
 
 
@@ -70,6 +71,19 @@ class RuntimeInputs(unittest.TestCase):
             runtime.prepare(ctx, kernel_build=True)
             self.assertEqual(ctx.need_config()['XNU_OWNER_DATA_VOLUME_UUID'], IDENTITY)
 
+    def test_plain_payload_rejects_packed_seed_uuid_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            ctx = self.context(Path(td))
+            ctx.board = {'payload': {'adt': {'packed_data_ramdisk': True}}}
+            ctx.config = ctx.need_config()
+            ctx.config_name = None
+            data = Path(ctx.args.data_ramdisk)
+            self.assertEqual(check_data_input(ctx, data), IDENTITY)
+            other = data.with_name('other.dbr')
+            seed(other, '11111111-2222-4333-8444-555555555555')
+            with self.assertRaisesRegex(Error, 'differs from compiled CONFIG_XNU_OWNER_DATA_VOLUME_UUID'):
+                check_data_input(ctx, other)
+
     def test_new_gap_rejected_but_resolved_gap_allowed(self):
         policy = dict(missing={}, stubbed={'owner': {'0x1000': 1}}, required_original_branches=['adapter'])
         record = dict(collection_slide='0x100', missing={}, stubbed={'owner': {'0x1100': 1}},
@@ -84,6 +98,15 @@ class RuntimeInputs(unittest.TestCase):
         record['native_original_branches'] = []
         with self.assertRaisesRegex(Error, 'adapter branch'):
             check_prelink_regressions(record, policy)
+
+    def test_gpu_enabled_payload_requires_addon_and_owner_trust(self):
+        arguments = ['native-ufs-root=1', 'sheng-gpu-addon=1']
+        with self.assertRaisesRegex(Error, '--gpu-addon'):
+            check_gpu_addon_input(arguments, None, 'owner.bundle')
+        with self.assertRaisesRegex(Error, '--owner-trust-cache'):
+            check_gpu_addon_input(arguments, 'gpu.ngpu', None)
+        check_gpu_addon_input(arguments, 'gpu.ngpu', 'owner.bundle')
+        check_gpu_addon_input(['sheng-gpu-addon=0'], None, None)
 
 
 if __name__ == '__main__':
