@@ -60,11 +60,25 @@ typedef struct {
 typedef struct {
     uint8_t ready;          /* the modem opened the channel */
     uint8_t hello_sent;     /* the first HELLO went out */
+    uint8_t reserved[2];
     uint32_t rx_packets;
     uint32_t tx_packets;
     uint32_t tx_again;
     uint32_t open_failures;
     uint32_t qrtr_servers;
+    /* Where the traffic stops. The link can be up while nothing arrives: the counters below say whether the
+       modem's bytes are sitting in the receive FIFO, whether the GLINK layer dropped them, or whether the QRTR
+       layer found them malformed. Without them there is no way to tell those three apart from the outside. */
+    uint32_t glink_rx_messages;   /* the GLINK layer's messages handled */
+    uint32_t glink_tx_messages;   /* the GLINK layer's messages written */
+    uint32_t glink_rx_data;       /* the GLINK layer's data messages delivered */
+    uint32_t glink_dropped;       /* the GLINK layer's data it could not deliver */
+    uint32_t glink_unknown_opens; /* channel opens for a name we do not have */
+    uint32_t rx_avail;            /* bytes waiting in the receive FIFO right now */
+    uint32_t ch_up, ch_remote_open, ch_open_sent, ch_open_acked;
+    uint32_t ch_local_advertised; /* our receive intents the modem knows about */
+    uint32_t qrtr_rx, qrtr_malformed, qrtr_hello_received, qrtr_hello_dropped;
+    char last_unknown[QCOM_GLINK_NAME];
 } fuxi_modem_link_status;
 
 /* The adapter's state. */
@@ -280,6 +294,25 @@ void fuxi_modem_status(fuxi_modem_link_status *status)
     status->tx_again = link->tx_again;
     status->open_failures = link->open_failures;
     status->qrtr_servers = link->qrtr.servers;
+    status->glink_rx_messages = link->glink.rx_messages;
+    status->glink_tx_messages = link->glink.tx_messages;
+    status->glink_rx_data = link->glink.rx_data;
+    status->glink_dropped = link->glink.dropped;
+    status->glink_unknown_opens = link->glink.unknown_opens;
+    status->rx_avail = qcom_glink_rx_avail(&link->glink.rx);
+    if (link->channel) {
+        status->ch_up = link->channel->up;
+        status->ch_remote_open = link->channel->remote_open;
+        status->ch_open_sent = link->channel->open_sent;
+        status->ch_open_acked = link->channel->open_acked;
+        for (unsigned k = 0; k < link->channel->intent_count; ++k)
+            if (link->channel->local[k].advertised) status->ch_local_advertised++;
+    }
+    status->qrtr_rx = link->qrtr.rx;
+    status->qrtr_malformed = link->qrtr.malformed;
+    status->qrtr_hello_received = link->qrtr.hello_received;
+    status->qrtr_hello_dropped = link->qrtr.hello_dropped;
+    for (unsigned b = 0; b < QCOM_GLINK_NAME; ++b) status->last_unknown[b] = link->glink.last_unknown[b];
 }
 
 /* What the link has seen, for the periodic report. */
