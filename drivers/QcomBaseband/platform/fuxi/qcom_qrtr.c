@@ -13,8 +13,27 @@ static void wr32(uint8_t *p, uint32_t v)
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
 
-static struct qrtr_server *server_find(struct qrtr_state *q, uint32_t service, uint32_t instance)
+/* Whether a packet type is one of the name service's control packets. */
+static int type_is_control(uint32_t type)
 {
+    switch (type) {
+    case QRTR_TYPE_HELLO:
+    case QRTR_TYPE_BYE:
+    case QRTR_TYPE_NEW_SERVER:
+    case QRTR_TYPE_DEL_SERVER:
+    case QRTR_TYPE_DEL_CLIENT:
+    case QRTR_TYPE_RESUME_TX:
+    case QRTR_TYPE_EXIT:
+    case QRTR_TYPE_PING:
+    case QRTR_TYPE_NEW_LOOKUP:
+    case QRTR_TYPE_DEL_LOOKUP:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static struct qrtr_server *server_find(struct qrtr_state *q, uint32_t service, uint32_t instance){
     /* The whole array is walked, not the first `servers` entries: a removed server leaves a hole. */
     for (uint32_t i = 0; i < QRTR_MAX_SERVERS; i++)
         if (q->server[i].present && q->server[i].service == service && q->server[i].instance == instance)
@@ -178,11 +197,13 @@ void qrtr_receive(struct qrtr_state *q, const void *data, uint32_t length)
         return;
     }
     q->rx++;
-    /* The first packet is dumped in full: the port has to learn which of the two command conventions the
-       peer uses, the one in the header's type field or the one in the body's first word (Linux net/qrtr/ns.c
-       reads the body's word), and the bytes say which. The hook is the board's, so it is not there on the
-       host; the model test does not need it. */
-    if (q->rx <= 2 && q->trace) q->trace(q->trace_context, p, length);
+    /* Control packets are dumped in full, and data packets are not: the wire has to be readable off the log, and the
+       control packets are the ones that carry the name service's state (which service, which instance, which node and
+       port). The dump is limited to the first few control packets so a busy link cannot flood the log. */
+    if (q->trace && type_is_control(rd32(p + 4)) && q->traced < 8) {
+        q->traced++;
+        q->trace(q->trace_context, p, length);
+    }
     if (rd32(p + 0) != QRTR_PROTO_VER_1) {
         q->malformed++;
         return;

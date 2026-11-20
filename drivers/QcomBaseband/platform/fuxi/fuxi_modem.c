@@ -104,9 +104,14 @@ typedef struct {
     uint8_t hello_pending;
     /* The HELLO went out. */
     uint8_t hello_sent;
+    /* The bridge has been published. It is published once, when the channel comes up. */
+    uint8_t published;
 } fuxi_modem_link;
 
 static fuxi_modem_link fuxi_link;
+
+/* The bridge's publish hook, defined below. The poll calls it once the channel is up. */
+void fuxi_modem_publish(void);
 
 /* The QRTR layer's send hook: one QRTR packet, header and payload already contiguous. The source port is the local
    port the packet comes from: the control port for a control packet, the client's own port for a DATA packet. */
@@ -287,6 +292,13 @@ void fuxi_modem_poll(void)
     /* The answer to the modem's HELLO is owed until the link has room for it: the remote's receive intent is still
        held by the packet that carried the HELLO. */
     if (link->qrtr.hello_reply_owed) qrtr_flush_hello_reply(&link->qrtr);
+    /* The bridge is published once the channel is up. It has to be published after, not before: the bridge's clients
+       are bound to the services the modem announces, and it needs this side's send hook to reach them. Until the
+       channel is up there is no route to the modem at all, so a bridge published earlier could only fail. */
+    if (link->ready && !link->published) {
+        link->published = 1;
+        fuxi_modem_publish();
+    }
     extern void coachz_baseband_poll(void);
     coachz_baseband_poll();
 }

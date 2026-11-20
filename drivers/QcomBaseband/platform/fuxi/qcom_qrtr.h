@@ -108,9 +108,11 @@ struct qrtr_state {
     qrtr_server_fn server_fn;
     qrtr_data_fn data_fn;
     void *context;
-    /* An optional hook that sees the first packets as they arrive, so the wire can be read off the log. */
+    /* An optional hook that sees the control packets as they arrive, so the wire can be read off the log. */
     void (*trace)(void *context, const uint8_t *bytes, uint32_t length);
     void *trace_context;
+    /* How many packets the trace hook has seen. The dump is limited, so a busy link cannot flood the log. */
+    uint32_t traced;
     /* Counters for the log. */
     uint32_t tx, rx, dropped, malformed, hello_dropped;
     char last_error[96];

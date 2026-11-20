@@ -1251,6 +1251,14 @@ extern "C" void coachz_baseband_report(unsigned second)
   printf("COACHZ baseband: %u s: %u QMI services, %u clients, dropped %u/%u; sahara state %u, %u executes, %u requests; board calls %u (%u unsupported); data port step %u, %u endpoints named, %u activations\n",
          second, servers, clients, bb_qmux.dropped, bb_tx_dropped, bb_sahara.state, bb_sahara.executes, bb_sahara.requests, bb_control.calls, bb_control.unsupported,
          bb_data.step, bb_endpoint_fixes, bb_activations);
+  /* The services the modem announced, by their QMI service id. The ids are what the client looks the service up by,
+     so a service the modem offered but the bridge never named shows up here as an id nobody asked for. */
+  for (uint32_t i = 0; i < CBQ_MAX_SERVERS; i++) {
+    const struct cbq_server *s = &bb_qmux.server[i];
+    if (!s->present) continue;
+    printf("COACHZ baseband: %u s: the modem offers service 0x%02x, version %u, instance %u, at node %u port %u\n",
+           second, s->service, s->version, s->instance, s->node, s->port);
+  }
   printf("COACHZ qmi: %u s: %u trace lines, %u held back by the budget\n", second, bb_trace_lines, bb_trace_held);
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) {
     const bb_channel *ch = &bb_ch[c];
