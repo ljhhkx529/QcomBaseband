@@ -78,6 +78,12 @@ typedef struct {
     uint32_t ch_up, ch_remote_open, ch_open_sent, ch_open_acked;
     uint32_t ch_local_advertised; /* our receive intents the modem knows about */
     uint32_t qrtr_rx, qrtr_malformed, qrtr_hello_received, qrtr_hello_dropped;
+    /* The name service's state. The modem's node id is learned from its HELLO; the reply to that HELLO is
+     * owed until the link has room for it, and the reply has to go back to the node and port the modem
+     * carried. If the reply never lands, the modem never announces its services. */
+    uint32_t qrtr_remote_node, qrtr_hello_reply_node, qrtr_hello_reply_port;
+    uint8_t qrtr_hello_reply_owed, qrtr_remote_node_known;
+    uint32_t glink_remote_intents;  /* the receive intents the modem granted us */
     char last_unknown[QCOM_GLINK_NAME];
 } fuxi_modem_link_status;
 
@@ -287,6 +293,8 @@ void fuxi_modem_status(fuxi_modem_link_status *status)
 {
     if (!status) return;
     fuxi_modem_link *link = &fuxi_link;
+    /* The caller's struct is not cleared: the counts below are read one at a time and the caller keeps its own
+     * copy of the earlier ones. Only the fields this function does not fill are cleared. */
     status->ready = link->ready;
     status->hello_sent = link->hello_sent;
     status->rx_packets = link->rx_packets;
@@ -300,6 +308,11 @@ void fuxi_modem_status(fuxi_modem_link_status *status)
     status->glink_dropped = link->glink.dropped;
     status->glink_unknown_opens = link->glink.unknown_opens;
     status->rx_avail = qcom_glink_rx_avail(&link->glink.rx);
+    status->ch_up = 0;
+    status->ch_remote_open = 0;
+    status->ch_open_sent = 0;
+    status->ch_open_acked = 0;
+    status->ch_local_advertised = 0;
     if (link->channel) {
         status->ch_up = link->channel->up;
         status->ch_remote_open = link->channel->remote_open;
@@ -312,6 +325,16 @@ void fuxi_modem_status(fuxi_modem_link_status *status)
     status->qrtr_malformed = link->qrtr.malformed;
     status->qrtr_hello_received = link->qrtr.hello_received;
     status->qrtr_hello_dropped = link->qrtr.hello_dropped;
+    status->qrtr_remote_node = link->qrtr.remote_node;
+    status->qrtr_hello_reply_node = link->qrtr.hello_reply_node;
+    status->qrtr_hello_reply_port = link->qrtr.hello_reply_port;
+    status->qrtr_hello_reply_owed = link->qrtr.hello_reply_owed;
+    status->qrtr_remote_node_known = link->qrtr.remote_node_known;
+    status->glink_remote_intents = 0;
+    if (link->channel) {
+        for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k)
+            if (link->channel->remote[k].valid) status->glink_remote_intents++;
+    }
     for (unsigned b = 0; b < QCOM_GLINK_NAME; ++b) status->last_unknown[b] = link->glink.last_unknown[b];
 }
 
