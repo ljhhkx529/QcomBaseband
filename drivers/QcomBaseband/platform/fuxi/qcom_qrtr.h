@@ -99,6 +99,8 @@ struct qrtr_state {
        HELLO. Without this the answer is lost and the peer never learns our node id. */
     uint8_t hello_reply_owed;
     uint32_t hello_reply_node, hello_reply_port;
+    /* The reply's control body: the command word the peer reads and the node and port it looks for. */
+    uint8_t hello_reply_body[QRTR_CTRL_LEN];
     struct qrtr_server server[QRTR_MAX_SERVERS];
     uint32_t servers;
     /* The link hooks. */
@@ -106,6 +108,9 @@ struct qrtr_state {
     qrtr_server_fn server_fn;
     qrtr_data_fn data_fn;
     void *context;
+    /* An optional hook that sees the first packets as they arrive, so the wire can be read off the log. */
+    void (*trace)(void *context, const uint8_t *bytes, uint32_t length);
+    void *trace_context;
     /* Counters for the log. */
     uint32_t tx, rx, dropped, malformed, hello_dropped;
     char last_error[96];
@@ -118,6 +123,9 @@ void qrtr_init(struct qrtr_state *q, uint32_t local_node, qrtr_send_fn send, qrt
                void *context);
 /* Sets the handler for DATA packets. */
 void qrtr_set_data_handler(struct qrtr_state *q, qrtr_data_fn data);
+/* Sets the hook that sees the first packets as they arrive. */
+void qrtr_set_trace(struct qrtr_state *q, void (*trace)(void *context, const uint8_t *bytes, uint32_t length),
+                    void *context);
 /* Sends one QRTR packet: the 32-byte header and the payload. The source port is the control port. */
 int qrtr_send(struct qrtr_state *q, uint32_t dst_node, uint32_t dst_port, uint32_t type, const void *body, uint32_t length);
 /* Sends one QRTR packet from a given source port. */

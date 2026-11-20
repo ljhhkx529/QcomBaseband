@@ -158,6 +158,36 @@ static void fuxi_glink_receive(void *context, QcomGlinkChannel *channel, const u
     qrtr_receive(&link->qrtr, data, length);
 }
 
+/* Dumps one received QRTR packet, header and body, so the wire can be read off the log. */
+static void fuxi_trace_qrtr(void *context, const uint8_t *bytes, uint32_t count)
+{
+    (void)context;
+    printf("FUXI_MODEM: the qrtr packet is %u bytes:", count);
+    for (uint32_t i = 0; i < count && i < 64; ++i) printf(" %02x", bytes[i]);
+    printf("\n");
+    if (count < QRTR_HDR_LEN) return;
+    const uint32_t head[8] = {
+        (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 | (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24,
+        (uint32_t)bytes[4] | (uint32_t)bytes[5] << 8 | (uint32_t)bytes[6] << 16 | (uint32_t)bytes[7] << 24,
+        (uint32_t)bytes[8] | (uint32_t)bytes[9] << 8 | (uint32_t)bytes[10] << 16 | (uint32_t)bytes[11] << 24,
+        (uint32_t)bytes[12] | (uint32_t)bytes[13] << 8 | (uint32_t)bytes[14] << 16 | (uint32_t)bytes[15] << 24,
+        (uint32_t)bytes[16] | (uint32_t)bytes[17] << 8 | (uint32_t)bytes[18] << 16 | (uint32_t)bytes[19] << 24,
+        (uint32_t)bytes[20] | (uint32_t)bytes[21] << 8 | (uint32_t)bytes[22] << 16 | (uint32_t)bytes[23] << 24,
+        (uint32_t)bytes[24] | (uint32_t)bytes[25] << 8 | (uint32_t)bytes[26] << 16 | (uint32_t)bytes[27] << 24,
+        (uint32_t)bytes[28] | (uint32_t)bytes[29] << 8 | (uint32_t)bytes[30] << 16 | (uint32_t)bytes[31] << 24,
+    };
+    printf("FUXI_MODEM: the qrtr header is version %u type %u src node %u src port %u, confirm %u, size %u, "
+           "dst node %u dst port %u\n",
+           head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7]);
+    if (count > QRTR_HDR_LEN) {
+        const uint32_t body0 = (uint32_t)bytes[QRTR_HDR_LEN] | (uint32_t)bytes[QRTR_HDR_LEN + 1] << 8 |
+            (uint32_t)bytes[QRTR_HDR_LEN + 2] << 16 | (uint32_t)bytes[QRTR_HDR_LEN + 3] << 24;
+        printf("FUXI_MODEM: the qrtr body is %u bytes, its first word is %u\n", count - QRTR_HDR_LEN, body0);
+    } else {
+        printf("FUXI_MODEM: the qrtr packet has no body\n");
+    }
+}
+
 /* The GLINK channel's state hook. */
 static void fuxi_glink_state(void *context, QcomGlinkChannel *channel, int up)
 {
@@ -238,6 +268,7 @@ int fuxi_modem_start(const fuxi_modem_link_config *config)
 
     qrtr_init(&link->qrtr, FUXI_QRTR_LOCAL_NODE, fuxi_qrtr_send, fuxi_qrtr_new_server, link);
     qrtr_set_data_handler(&link->qrtr, fuxi_qrtr_data);
+    qrtr_set_trace(&link->qrtr, fuxi_trace_qrtr, 0);
     /* The HELLO is owed, not sent: the GLINK channel is only up once the modem opens it, and a HELLO sent before
        that is dropped by the link with nothing to show for it. The owner's poll sends it as soon as the channel is
        up. */

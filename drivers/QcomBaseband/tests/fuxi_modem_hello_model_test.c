@@ -97,13 +97,17 @@ static void test_hello_waits_for_the_channel(void)
     CHECK(a.hello_pending == 0);
     CHECK(a.qrtr.hello_sent == 1);
 
-    /* It is a HELLO to the broadcast node on the control port, with no body. */
+    /* It is a HELLO to the broadcast node on the control port, and it carries the control body the peer reads
+       the command word from (Linux net/qrtr/ns.c switches on pkt->cmd, and the modem's own HELLO, the bytes the
+       device sent on 2026-11-20, had a 20-byte body whose first word was the command). */
     CHECK(rd32(sent[0] + 4) == QRTR_TYPE_HELLO);
     CHECK(rd32(sent[0] + 8) == 1);              /* our node id */
     CHECK(rd32(sent[0] + 12) == QRTR_PORT_CTRL); /* the control port */
     CHECK(rd32(sent[0] + 24) == QRTR_NODE_BCAST);
     CHECK(rd32(sent[0] + 28) == QRTR_PORT_CTRL);
-    CHECK(rd32(sent[0] + 20) == 0);              /* no body */
+    CHECK(rd32(sent[0] + 20) == QRTR_CTRL_LEN);  /* the control body */
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN) == QRTR_TYPE_HELLO);
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN + 4) == 1); /* our node id, where the peer looks for it */
 }
 
 /* The old behaviour: sending the HELLO from the start call, before the channel is up, loses it. The protocol layer

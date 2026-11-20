@@ -262,18 +262,26 @@ static void modem_step(void)
         return;
     }
     if (!modem_hello_sent && modem_intent_granted && adapter_intent_id) {
-        /* The modem's own QRTR HELLO: node 5, on the control port, on the AP's advertised receive intent. */
+        /* The modem's own QRTR HELLO: node 5, on the control port, on the AP's advertised receive intent. It
+           carries the control body the peer reads the command word from, the way the modem's real one does: the
+           bytes the device sent on 2026-11-20 had a 20-byte body whose first word was the command. */
         modem_hello_sent = 1;
-        uint8_t q[QRTR_HDR_LEN];
+        uint8_t body[QRTR_CTRL_LEN];
+        memset(body, 0, sizeof body);
+        mod_put32(body + 0, QRTR_TYPE_HELLO);
+        mod_put32(body + 4, 7907);        /* the modem's own id, in the union's node field */
+        mod_put32(body + 8, 10);
+        uint8_t q[QRTR_HDR_LEN + QRTR_CTRL_LEN];
         memset(q, 0, sizeof q);
         mod_put32(q + 0, QRTR_PROTO_VER_1);
         mod_put32(q + 4, QRTR_TYPE_HELLO);
         mod_put32(q + 8, 5);              /* the modem's node id */
         mod_put32(q + 12, QRTR_PORT_CTRL);
         mod_put32(q + 16, 0);
-        mod_put32(q + 20, 0);
+        mod_put32(q + 20, sizeof body);
         mod_put32(q + 24, 1);            /* to us */
         mod_put32(q + 28, QRTR_PORT_CTRL);
+        memcpy(q + QRTR_HDR_LEN, body, sizeof body);
         uint8_t h[16];
         h[0] = QCOM_GLINK_TX_DATA; h[1] = 0; h[2] = (uint8_t)MOD_LCID; h[3] = 0;
         mod_put32(h + 4, adapter_intent_id);
@@ -359,7 +367,10 @@ static void test_the_hello_reaches_the_modem(void)
     if (hello_index >= 0) {
         CHECK(rd32(packets[hello_index] + 8) == FUXI_QRTR_LOCAL_NODE);
         CHECK(rd32(packets[hello_index] + 12) == QRTR_PORT_CTRL);
-        CHECK(rd32(packets[hello_index] + 20) == 0);
+        /* The control body the peer reads the command word from. */
+        CHECK(rd32(packets[hello_index] + 20) == QRTR_CTRL_LEN);
+        CHECK(rd32(packets[hello_index] + QRTR_HDR_LEN) == QRTR_TYPE_HELLO);
+        CHECK(rd32(packets[hello_index] + QRTR_HDR_LEN + 4) == FUXI_QRTR_LOCAL_NODE);
     }
 
     /* The link is up and the protocol layer knows it sent its HELLO. */

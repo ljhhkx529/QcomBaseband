@@ -66,11 +66,18 @@ static void test_hello(void)
     qrtr_init(&q, 7, link_send, link_server, 0);
     sent_count = 0;
     CHECK(qrtr_send(&q, 3, QRTR_PORT_CTRL, QRTR_TYPE_HELLO, 0, 0) == 0);
-    CHECK(sent_count == 1 && sent_len[0] == QRTR_HDR_LEN);
+    /* The control packet carries the command word the peer reads, in the body. The modem's own HELLO, the bytes
+       the device sent on 2026-11-20, had a 20-byte body whose first word was the command. A control packet with
+       no body has no command word for the peer's name service to read (Linux net/qrtr/ns.c switches on
+       pkt->cmd), and upstream's receive path refuses a zero-size packet outright. */
+    CHECK(sent_count == 1 && sent_len[0] == QRTR_HDR_LEN + QRTR_CTRL_LEN);
     CHECK(rd32(sent[0] + 0) == QRTR_PROTO_VER_1);
     CHECK(rd32(sent[0] + 4) == QRTR_TYPE_HELLO);
     CHECK(rd32(sent[0] + 8) == 7);
     CHECK(rd32(sent[0] + 28) == QRTR_PORT_CTRL);
+    CHECK(rd32(sent[0] + 20) == QRTR_CTRL_LEN);
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN + 0) == QRTR_TYPE_HELLO);
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN + 4) == 7);
     CHECK(q.hello_sent);
 }
 
@@ -208,9 +215,16 @@ static void test_peer_hello(void)
 {
     static struct qrtr_state q;
     uint8_t packet[256];
+    uint8_t peer_body[QRTR_CTRL_LEN];
     qrtr_init(&q, 7, link_send, link_server, 0);
     sent_count = 0;
-    const uint32_t n = build(packet, QRTR_TYPE_HELLO, 9, QRTR_PORT_CTRL, 0, 0);
+    /* The peer's HELLO, built the way the modem builds it: the bytes the device sent on 2026-11-20 had a
+       20-byte body whose first word was the command. */
+    memset(peer_body, 0, sizeof peer_body);
+    wr32(peer_body + 0, QRTR_TYPE_HELLO);
+    wr32(peer_body + 4, 7907);
+    wr32(peer_body + 8, 10);
+    const uint32_t n = build(packet, QRTR_TYPE_HELLO, 9, QRTR_PORT_CTRL, peer_body, sizeof peer_body);
     qrtr_receive(&q, packet, n);
     CHECK(q.hello_received);
     CHECK(q.remote_node == 9 && q.remote_node_known);
@@ -219,6 +233,11 @@ static void test_peer_hello(void)
     CHECK(rd32(sent[0] + 8) == 7);
     CHECK(rd32(sent[0] + 24) == 9);
     CHECK(rd32(sent[0] + 12) == QRTR_PORT_CTRL);
+    /* And the answer carries the command word the peer reads, and our own node id where it looks for it. */
+    CHECK(sent_len[0] == QRTR_HDR_LEN + QRTR_CTRL_LEN);
+    CHECK(rd32(sent[0] + 20) == QRTR_CTRL_LEN);
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN + 0) == QRTR_TYPE_HELLO);
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN + 4) == 7);
 }
 
 int main(void)
