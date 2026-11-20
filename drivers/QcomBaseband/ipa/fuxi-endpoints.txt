@@ -1,0 +1,11 @@
+# The fuxi (Xiaomi 13, SM8550) endpoint numbering.
+#
+# The generic IPA v5.5 table numbers the AP-side modem endpoints 23 (AP_MODEM_RX) and 21 (MODEM_AP_RX). The fuxi
+# silicon uses 24 and 22 instead. Both numbers come from the mainline fuxi kernel's board patch
+# (drivers/net/ipa/data/ipa_data-v5.5.c), which is the only primary source for them.
+#
+# Regenerate the table with:
+#   python3 -I gen_ipa_data.py <linux-tree> linux-stubs ../ipa/coachz_ipa_v55.h --version v5.5 --endpoints fuxi-endpoints.txt
+
+IPA_ENDPOINT_AP_MODEM_RX = 24
+IPA_ENDPOINT_MODEM_AP_RX = 22

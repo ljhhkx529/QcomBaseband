@@ -533,3 +533,22 @@ runtime_identifiers = ["ShengPreflight"]
 build_stage = "firmware"
 build = []
 outputs = []
+
+[[component]]
+id = "QcomBaseband"
+kind = "driver"
+function = "Qualcomm baseband IOKit bridge, QMUX/QRTR and IPA"
+scope = "modem"
+repository = "https://github.com/UniXNU/QcomBaseband.git"
+revision = "dd0199cf3300764ed52b23f4a47761f91fab21a2"
+path = "drivers/QcomBaseband"
+hardware = ["Qualcomm QMI over QRTR", "SM8550 IPA v5.5"]
+os_abi = ["ipados-17.7.11-21H461 AppleBaseband IOUserClient"]
+board_dependencies = ["modem power and firmware boot", "GLINK/QRTR transport and rmtfs", "DMA and EFS/NV storage", "cellular ADT and firmware packaging", "raw-IP transport on the QRTR/IPA owner thread"]
+verified_devices = []
+dependencies = []
+source_files = ["baseband/coachz_baseband.cpp", "baseband/QcomBaseband.h", "baseband/coachz_bb_pdp.cpp", "baseband/coachz_bb_pdp.h", "ipa/coachz_ipa_kernel.h", "ipa/coachz_ipa_v55.h", "platform/fuxi/qcom_qrtr.h", "platform/fuxi/qcom_qrtr.c", "platform/fuxi/fuxi_modem.c"]
+runtime_identifiers = ["AppleBaseband", "AppleBasebandPCIControl", "AppleBasebandPCIInterface", "AppleIPAppender", "AppleBasebandPCIMAVPDPManager", "coachz_baseband_configure", "fuxi_modem_start", "fuxi_modem_poll", "fuxi_modem_report", "fuxi_modem_publish", "pdp_ip0", "pdp_ip1", "pdp_ip2", "pdp_ip3"]
+build_stage = "kernel"
+build = ["build-qcom-baseband.py", "--fuxi"]
+outputs = ["build/qcom-baseband/libQcomBaseband.a"]
