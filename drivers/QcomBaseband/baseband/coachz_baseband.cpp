@@ -25,6 +25,7 @@
 #include "coachz_bb_data.h"
 #include "coachz_bb_pdp.h"
 #include "coachz_bb_esim.h"
+#include "coachz_bb_ssctl.h"
 
 #define BB_FRAME_MAX (64u * 1024u)       // one read or write: a QMUX frame, a SAHARA packet or a READ_DATA answer
 // Frames waiting for ABM, per channel. At boot the 53 clients' registrations and indications arrive faster than ABM reads; with 64 the
@@ -61,7 +62,12 @@ static struct cbc_state bb_control;
 static bb_channel bb_ch[CBH_PUBLISHED];
 static bb_tx bb_txq[BB_TX];
 static uint32_t bb_tx_head, bb_tx_count, bb_tx_dropped;
-static void (*bb_send)(uint32_t local_port, uint32_t node, uint32_t port, const void *message, uint32_t length);
+/* The refusals the link made since the last time they were reported. */
+static uint32_t bb_tx_refused;
+static uint32_t bb_refused_last;
+/* Whether the last send went out. A send that the link refused (no room, or the peer is out of credit) has to be
+   tried again, so the bridge asks. */
+static int (*bb_send)(uint32_t local_port, uint32_t node, uint32_t port, const void *message, uint32_t length);
 static void (*bb_del_client)(uint32_t local_port);
 static int bb_published;
 static uint32_t bb_private_seen[64], bb_private_count, bb_ctl_logged;
@@ -80,6 +86,11 @@ static uint8_t bb_uim_cid[BB_TX];
 static uint8_t *bb_esim_in, *bb_esim_resp;
 #define BB_ESIM_BYTES (1024u * 1024u)
 
+// The modem's own list of its services, asked for over SSCTL (coachz_bb_ssctl.h). The name service does not
+// answer this modem, so the list has to be asked of the modem itself.
+static struct cbq_ssctl bb_ssctl;
+static int bb_ssctl_slot = -1;
+
 static uint32_t bb_now_ms(void)
 {
   uint64_t ticks, ns;
@@ -90,7 +101,7 @@ static uint32_t bb_now_ms(void)
 
 extern "C" {
 int coachz_baseband_enabled(void);
-void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t));
+void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t));
 void coachz_baseband_new_server(uint32_t service, uint32_t version_instance, uint32_t node, uint32_t port);
 void coachz_baseband_del_server(uint32_t service, uint32_t node, uint32_t port);
 int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body, uint32_t size);
@@ -351,6 +362,51 @@ static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
     printf("COACHZ baseband: data port: service %u message 0x%x endpoint %u/%u %s %u/%u\n", r.service, (uint32_t)(sdu[3] | sdu[4] << 8),
            f.before_type, f.before_interface, f.inserted ? "added as" : "now", CBD_EP_EMBEDDED, CBD_EP_INTERFACE);
   bb_queue_tx(r.local_port, r.node, r.port, bb_fix, f.len);
+}
+
+// The modem's answer about itself, on the record.
+static void bb_ssctl_log(const uint8_t *sdu, uint32_t size)
+{
+  printf("COACHZ baseband: the SSCTL answer: error %u, %u bytes of reason\n", bb_ssctl.error, bb_ssctl.reason_len);
+  if (bb_ssctl.reason_len) printf("COACHZ baseband: the modem says: %s\n", bb_ssctl.reason);
+  /* The answer's own bytes. The TLV layout of the reason is not in this tree, so the bytes are what settles
+     it: an answer that names a reason and one that does not look different in a way that can be read off the
+     log. */
+  printf("COACHZ baseband: the answer is %u bytes:", size);
+  for (uint32_t i = 0; i < size && i < 64; ++i) printf(" %02x", sdu[i]);
+  printf("\n");
+  printf("COACHZ baseband: the answer carries %u TLVs:", bb_ssctl.tlv_count);
+  for (uint32_t i = 0; i < bb_ssctl.tlv_count; ++i)
+    printf(" type 0x%02x of %u bytes", bb_ssctl.tlv_types[i], bb_ssctl.tlv_lens[i]);
+  printf("\n");
+}
+
+// The one SSCTL request that is safe to send: the failure reason.
+//
+// The SSCTL service is subsystem control, and two of its four messages stop the modem: 0x0020 restarts the
+// modem's subsystem and 0x0021 shuts it down. The earlier sweep of the message ids was asking for exactly
+// those, one id a second, and the modem stopped answering because it had been told to stop. The ids 0x0020
+// and 0x0021 are never sent from here.
+//
+// What is asked instead is id 0x0022, the failure reason, which takes no TLVs and only reads. It is asked
+// once, and only after the modem has been quiet for a while, because a modem that is running has no failure
+// to report and the answer would be empty. The reason is the modem's own statement of why it stopped, which
+// is the one thing the log cannot work out on its own.
+static void bb_ssctl_step(void)
+{
+  const struct cbq_server *server = cbq_server_find(&bb_qmux, CBS_SVC_SSCTL);
+  if (!server) return;
+  if (bb_ssctl_slot < 0) bb_ssctl_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, CBS_SVC_SSCTL);
+  if (bb_ssctl_slot < 0) return;
+  if (bb_ssctl.sent || bb_ssctl.answered) return;
+  uint8_t sdu[32];
+  const uint32_t n = cbs_build_request_id(sdu, sizeof sdu, 0x22u, CBS_SSCTL_GET_FAILURE_REASON);
+  if (!n) return;
+  const uint32_t queued = bb_tx_count;
+  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_ssctl_slot, server->node, server->port, sdu, n);
+  /* The request is asked once. A queue that was full is asked again on the next poll, and a request that did
+     go out is not asked again: the failure reason does not change while the modem runs. */
+  if (bb_tx_count != queued) bb_ssctl.sent = 1;
 }
 
 // eSIM control runs on the same QRTR owner as the other QMI traffic (bb_lock held).
@@ -1146,7 +1202,7 @@ static Service *bb_publish(IOService *provider, uint32_t channel = ~0u)
 }
 
 // The modem's QRTR is up (GLINK started): publish the services ABM looks for. `send` and `del_client` run on the Wi-Fi thread only.
-extern "C" void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t))
+extern "C" void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t))
 {
   if (!coachz_baseband_enabled() || bb_published) return;
   bb_init();
@@ -1191,7 +1247,16 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
   const struct cbq_result r = cbq_from_modem(&bb_qmux, dst_port, src_node, static_cast<const uint8_t *>(body), size, bb_out, sizeof bb_out);
   if (r.kind == CBQ_TO_HOST && r.channel == CBQ_INTERNAL) {
     bb_trace("int-rx", 0, r.service, r.cid, static_cast<const uint8_t *>(body), size);
-    if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
+    if (bb_ssctl_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_ssctl_slot &&
+        r.service == CBS_SVC_SSCTL) {
+      // The modem's answer to the failure reason request.
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      /* The TLVs of this answer only: the counter is cleared before the answer is read, so the types the log
+         shows are the ones this answer carried. */
+      bb_ssctl.tlv_count = 0;
+      const int read = cbs_read_answer(&bb_ssctl, sdu, size);
+      if (read) bb_ssctl_log(sdu, size);
+    } else if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
       cbe_answer(&bb_esim, static_cast<const uint8_t *>(body), size, bb_now_ms());
     } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
   } else if (r.kind == CBQ_TO_HOST) {
@@ -1223,6 +1288,7 @@ extern "C" void coachz_baseband_poll(void)
   bb_tx batch[16];
   uint32_t n = 0, released[16], r = 0, port;
   IOLockLock(bb_lock);
+  bb_ssctl_step();
   bb_esim_step();
   while (bb_tx_count && n < 16) {
     batch[n++] = bb_txq[bb_tx_head];
@@ -1231,9 +1297,35 @@ extern "C" void coachz_baseband_poll(void)
   }
   while (r < 16 && (port = cbq_next_release(&bb_qmux))) released[r++] = port;
   IOLockUnlock(bb_lock);
+  /* A send the link refused goes back on the queue: the QRTR layer refuses a DATA packet when the peer is out of
+     credit, and the credit comes back with a RESUME_TX. Dropping the request here would lose it with nothing on
+     the log to say so. The queue is put back under the lock, in order, so the requests keep their order. */
+  uint32_t refused = 0;
   for (uint32_t i = 0; i < n; i++) {
-    bb_send(batch[i].local_port, batch[i].node, batch[i].port, batch[i].data, batch[i].len);
-    IOFreeData(batch[i].data, batch[i].len);
+    if (bb_send(batch[i].local_port, batch[i].node, batch[i].port, batch[i].data, batch[i].len) != 0) {
+      IOLockLock(bb_lock);
+      if (bb_tx_count < BB_TX) {
+        bb_txq[(bb_tx_head + bb_tx_count++) % BB_TX] = batch[i];
+        refused++;
+      } else {
+        IOFreeData(batch[i].data, batch[i].len);
+        bb_tx_dropped++;
+      }
+      IOLockUnlock(bb_lock);
+    } else {
+      IOFreeData(batch[i].data, batch[i].len);
+    }
+  }
+  if (refused) {
+    /* The poll runs as fast as the caller calls it, so a request that the link keeps refusing would print on
+       every pass and fill the log with millions of lines. The refusals are counted and reported with the rest
+       of the bridge's state, once a second, which says the same thing without the flood. */
+    bb_tx_refused += refused;
+    if (bb_now_ms() - bb_refused_last >= 1000u) {
+      bb_refused_last = bb_now_ms();
+      printf("COACHZ baseband: %u QMI requests were refused by the link and are tried again\n", bb_tx_refused);
+      bb_tx_refused = 0;
+    }
   }
   for (uint32_t i = 0; i < r; i++)
     if (bb_del_client) bb_del_client(released[i]);
@@ -1260,6 +1352,13 @@ extern "C" void coachz_baseband_report(unsigned second)
            second, s->service, s->version, s->instance, s->node, s->port);
   }
   printf("COACHZ qmi: %u s: %u trace lines, %u held back by the budget\n", second, bb_trace_lines, bb_trace_held);
+  /* What the modem says about itself. The failure reason is the modem's own statement of why it stopped,
+     and it is the one thing the log cannot work out on its own. */
+  if (bb_ssctl.answered)
+    printf("COACHZ baseband: %u s: the modem's failure reason: error %u, %u bytes of reason\n", second,
+           bb_ssctl.error, bb_ssctl.reason_len);
+  else if (bb_ssctl.sent)
+    printf("COACHZ baseband: %u s: the modem's failure reason was asked for, no answer yet\n", second);
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) {
     const bb_channel *ch = &bb_ch[c];
     if (ch->opens)

@@ -74,7 +74,7 @@
  extern void coachz_modem_poll(void);
  extern void coachz_modem_report(unsigned);
 +/* The cellular bridge (drivers/RamBlock coachz_baseband.cpp, /chosen/coachz-baseband): ABM's QMUX clients as QRTR ports from 0x4100. */
-+extern void coachz_baseband_configure(void (*)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*)(uint32_t));
++extern void coachz_baseband_configure(int (*)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*)(uint32_t));
 +extern void coachz_baseband_new_server(uint32_t, uint32_t, uint32_t, uint32_t);
 +extern void coachz_baseband_del_server(uint32_t, uint32_t, uint32_t);
 +extern int coachz_baseband_qrtr(uint32_t, uint32_t, uint32_t, const void *, uint32_t);
@@ -87,11 +87,13 @@
      wq_send(cmd, WQ_CTRL, dst_node, WQ_CTRL, pkt, sizeof(pkt));
  }
  
-+/* The bridge's QMI clients: one local port each, as libqmi's QRTR backend opens one socket per client. Wi-Fi thread only. */
-+static void
++/* The bridge's QMI clients: one local port each, as libqmi's QRTR backend opens one socket per client. Wi-Fi thread only.
++ * The bridge retries a request the link refused, so the refusal has to be reported. */
++static int
 +wb_send(uint32_t local_port, uint32_t node, uint32_t port, const void *message, uint32_t length)
 +{
 +    wq_send(1, local_port, node, port, message, length);
++    return 0;
 +}
 +
 +/* af_qrtr.c qrtr_port_remove: a closed client is announced to the peer as DEL_CLIENT {node, port}. */
