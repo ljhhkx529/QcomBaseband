@@ -32,9 +32,12 @@ def check_args(arguments):
         if not re.fullmatch(r'[A-Za-z0-9_.\-]+(=[A-Za-z0-9_.,/\-]+)?', value):
             raise Error(f'unsupported kernel argument: {value}')
     line = ' '.join(arguments)
-    # DarwinBoot copies the command line into a 1024-byte buffer and refuses a longer one.
-    if len(line) > 1000:
-        raise Error(f'the kernel command line is {len(line)} bytes; the limit is 1000')
+    # DarwinBoot copies the command line into a 1024-byte buffer and refuses a longer one:
+    # DarwinBootPkg/Driver/DarwinBoot.c rejects at "Index >= sizeof (CommandLine) - 1", so 1023 bytes
+    # fit with their terminator, and XNU reads the same buffer (BOOT_LINE_LENGTH 1024 in
+    # pexpert/pexpert/arm64/boot.h).
+    if len(line) > 1023:
+        raise Error(f'the kernel command line is {len(line)} bytes; the limit is 1023')
     return line
 
 
@@ -247,7 +250,7 @@ def build(ctx, kernel=None):
             command.append('--ipad-identity')
         if data and adt.get('persistent_data'):
             command.append('--persistent-data')
-        # Fixups of signed text (patches/xnu/native-text-fixup.patch) travel in /chosen/text-fixups, outside the 1000-byte command line.
+        # Fixups of signed text (patches/xnu/native-text-fixup.patch) travel in /chosen/text-fixups, outside the command line.
         for fixup in spec.get('text_fixups', []):
             if not re.fullmatch(r'[A-Za-z0-9_.\-]{1,63},[0-9a-fA-F]{1,16},(?:[0-9a-fA-F]{2}){1,16},(?:[0-9a-fA-F]{2}){1,16}', fixup) or len(fixup) >= 160:
                 raise Error(f'malformed text fixup in board.toml [payload] text_fixups: {fixup}')

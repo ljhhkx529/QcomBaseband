@@ -9,7 +9,10 @@ from pathlib import Path
 from . import payload
 from .util import Error, git, log, sha256_file
 
-MAX_COMMAND_LINE = 1000
+# DarwinBoot's CommandLine buffer is 1024 bytes and it refuses an index at or above
+# sizeof (CommandLine) - 1, so 1023 bytes fit with their terminator. XNU reads the same
+# buffer (BOOT_LINE_LENGTH 1024 in pexpert/pexpert/arm64/boot.h).
+MAX_COMMAND_LINE = 1024
 
 
 def outputs(ctx):
