@@ -110,6 +110,10 @@ struct qrtr_state {
     uint32_t peer_node, peer_port;
     uint8_t peer_node_known;
     uint8_t remote_node_known, hello_sent, hello_received;
+    /* How many HELLOs the peer has sent. The peer sends one again whenever it (re)opens its link, and a
+       service this side offers is announced again on each of them: the peer learns of the service only from
+       the announcement, so a HELLO that is not answered with one leaves the peer without the service. */
+    uint32_t hellos;
     /* The reply to the peer's HELLO, owed when the link could not take it the first time. The link is busy more
        often than not right after the handshake: the remote's intent is still held by the packet that carried the
        HELLO. Without this the answer is lost and the peer never learns our node id. */
@@ -184,6 +188,10 @@ int qrtr_send_from(struct qrtr_state *q, uint32_t src_port, uint32_t dst_node, u
 int qrtr_send_data(struct qrtr_state *q, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *body, uint32_t length);
 /* Tells the peer that a local client port is gone. */
 int qrtr_send_del_client(struct qrtr_state *q, uint32_t local_port);
+/* Announces one of our own services to the peer: a NEW_SERVER to the peer's control port, naming the
+ * service, the version and instance it is published under, and the local port it is served on. */
+int qrtr_send_new_server(struct qrtr_state *q, uint32_t dst_node, uint32_t service, uint32_t version, uint32_t instance,
+                         uint32_t port);
 /* Asks the peer which services it has.
  *
  * The peer answers with NEW_SERVER for every service that matches and with an empty NEW_SERVER at the end of the

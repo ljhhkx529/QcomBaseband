@@ -366,6 +366,37 @@ static void test_flow_control(void)
     CHECK(last_dst_port == 0x05);
 }
 
+/* Announcing one of our own services: the NEW_SERVER the peer reads to learn that the service exists and
+   where it is. The body carries the command word, the service, the instance word (the version in the low
+   byte and the instance in the high one), our own node and the local port the service is served on. */
+static void test_send_new_server(void)
+{
+    static struct qrtr_state q;
+    qrtr_init(&q, 1, link_send, link_server, 0);
+    sent_count = 0;
+    /* The HELLO goes out first: a DATA or a control packet that is not a HELLO is refused before our own
+       HELLO has gone out, because the peer's name service ignores it. */
+    CHECK(qrtr_send(&q, QRTR_NODE_BCAST, QRTR_PORT_CTRL, QRTR_TYPE_HELLO, 0, 0) == 0);
+    sent_count = 0;
+
+    /* The service registry's locator: service 0x40, version 1, instance 1, on the local port 0x4001. */
+    CHECK(qrtr_send_new_server(&q, 0, 0x40, 1, 1, 0x4001) == 0);
+    CHECK(sent_count == 1);
+    CHECK(sent_len[0] == QRTR_HDR_LEN + QRTR_CTRL_LEN);
+    CHECK(rd32(sent[0] + 4) == QRTR_TYPE_NEW_SERVER);
+    /* A control packet: the control port as its source and destination, and the node it is addressed to. */
+    CHECK(rd32(sent[0] + 12) == QRTR_PORT_CTRL);
+    CHECK(rd32(sent[0] + 24) == 0);
+    CHECK(rd32(sent[0] + 28) == QRTR_PORT_CTRL);
+    /* The body: the command word the peer switches on, the service, the instance word, our node and the port.
+       The instance word of version 1 and instance 1 is 0x0101, which is the value 257. */
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN + 0) == QRTR_TYPE_NEW_SERVER);
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN + 4) == 0x40);
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN + 8) == 0x0101);
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN + 12) == 1);
+    CHECK(rd32(sent[0] + QRTR_HDR_LEN + 16) == 0x4001);
+}
+
 int main(void)
 {
     test_header();
@@ -373,6 +404,7 @@ int main(void)
     test_framing();
     test_control_ports();
     test_new_server();
+    test_send_new_server();
     test_data();
     test_peer_hello();
     test_lookup();

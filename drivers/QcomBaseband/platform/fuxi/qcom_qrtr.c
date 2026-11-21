@@ -142,6 +142,28 @@ static void build_ctrl_body(uint8_t *body, uint32_t cmd, uint32_t node, uint32_t
     wr32(body + 8, port);
 }
 
+/* Announces one of our own services to the peer.
+ *
+ * The body is a whole qrtr_ctrl_pkt: the command word the peer switches on, and then the service, the
+ * instance word, our node and the local port the service is served on. The instance word holds the version in
+ * its low byte and the instance in its high byte (the same word the lookup uses, Linux drivers/soc/qcom/
+ * qmi_interface.c, qmi_send_new_lookup), so version 1 and instance 1 are the word 0x0101.
+ *
+ * The peer reads the command word out of the body and not out of the header's type field, the same way it
+ * reads the HELLO's. */
+int qrtr_send_new_server(struct qrtr_state *q, uint32_t dst_node, uint32_t service, uint32_t version, uint32_t instance,
+                         uint32_t port)
+{
+    uint8_t body[QRTR_CTRL_LEN];
+    memset(body, 0, sizeof body);
+    wr32(body + 0, QRTR_TYPE_NEW_SERVER);
+    wr32(body + 4, service);
+    wr32(body + 8, (version & 0xffu) | ((instance & 0xffu) << 8));
+    wr32(body + 12, q->local_node);
+    wr32(body + 16, port);
+    return qrtr_send(q, dst_node, QRTR_PORT_CTRL, QRTR_TYPE_NEW_SERVER, body, sizeof body);
+}
+
 int qrtr_send_lookup(struct qrtr_state *q, uint32_t service, uint32_t version, uint32_t instance)
 {
     uint8_t body[QRTR_CTRL_LEN];
@@ -356,6 +378,7 @@ void qrtr_receive(struct qrtr_state *q, const void *data, uint32_t length)
 
     if (type == QRTR_TYPE_HELLO) {
         q->hello_received = 1;
+        q->hellos++;
         q->remote_node = src_node;
         q->remote_node_known = 1;
         /* The peer's HELLO body carries a node and a port of its own, next to the command word. The header

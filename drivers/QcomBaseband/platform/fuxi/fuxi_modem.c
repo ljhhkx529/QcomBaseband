@@ -21,6 +21,8 @@
 
 #include "qcom_qrtr.h"
 
+#include "fuxi_servreg.h"
+
 #include "QcomGlink.h"
 #include "QcomSmem.h"
 
@@ -109,6 +111,9 @@ typedef struct {
     /* The QRTR flow control: the DATA packets the peer has not credited yet, and the RESUME_TX packets sent and
        received. A peer that runs out of credit stops answering, and the credit comes back with RESUME_TX. */
     uint32_t qrtr_tx_pending, qrtr_resumes_sent, qrtr_resumes_received;
+    /* The service registry's locator: how often it was announced, how many requests it took and how many of
+       them were answered. A request count that stays at zero says the modem never asked. */
+    uint32_t locator_announces, locator_requests, locator_answered;
     char last_unknown[QCOM_GLINK_NAME];
 } fuxi_modem_link_status;
 
@@ -142,6 +147,13 @@ typedef struct {
     /* When the wildcard lookup was last asked, in milliseconds. The poll runs far more often than that, so the
        re-ask is counted in time and not in polls. */
     uint32_t wildcard_at;
+    /* The service registry's locator. It is announced once the link is up and again on every router HELLO, and
+       it is served on its own local port. The counts say what the modem asked of it. */
+    uint8_t locator_announced;
+    uint32_t locator_announces, locator_requests, locator_answered;
+    /* The number of the peer's HELLOs the last announcement answered. The announcement is sent again when the
+       peer's count has moved past it, so a HELLO is always answered with one. */
+    uint32_t locator_hello_at;
 
 } fuxi_modem_link;
 
@@ -149,6 +161,10 @@ static fuxi_modem_link fuxi_link;
 
 /* The bridge's publish hook, defined below. The poll calls it once the channel is up. */
 void fuxi_modem_publish(void);
+
+/* The locator's receive handler, defined below. */
+static void fuxi_servreg_receive(fuxi_modem_link *link, uint32_t src_node, uint32_t src_port, const void *body,
+                                  uint32_t length);
 
 /* The QRTR layer's send hook: one QRTR packet, header and payload already contiguous. The source port is the local
    port the packet comes from: the control port for a control packet, the client's own port for a DATA packet. */
@@ -188,6 +204,12 @@ static void fuxi_qrtr_data(void *context, uint32_t dst_port, uint32_t src_node, 
 {
     fuxi_modem_link *link = context;
     link->rx_packets++;
+    /* The service registry's locator is served on its own port, and not by the bridge: it is the host service
+       the modem asks where its own services are, and it is answered straight out of the modem's own table. */
+    if (dst_port == FUXI_LOCATOR_PORT) {
+        fuxi_servreg_receive(link, src_node, src_port, body, length);
+        return;
+    }
     extern int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body, uint32_t size);
     coachz_baseband_qrtr(dst_port, src_node, src_port, body, length);
 }
@@ -198,6 +220,63 @@ static void fuxi_glink_receive(void *context, QcomGlinkChannel *channel, const u
     (void)context; (void)channel;
     fuxi_modem_link *link = &fuxi_link;
     qrtr_receive(&link->qrtr, data, length);
+}
+
+/* The service registry's locator: answers what the modem asks it.
+ *
+ * The answer goes back to the node and port the request came from, from the locator's own port, because the
+ * modem routes the answer back by the port the request named. The request's bytes and the answer's bytes go
+ * to the log, so the wire can be read off the capture: what the modem asked for, and what was told. */
+static void fuxi_servreg_receive(fuxi_modem_link *link, uint32_t src_node, uint32_t src_port, const void *body,
+                                  uint32_t length)
+{
+    uint8_t answer[256];
+    uint32_t answer_length = 0;
+    char wanted[64];
+    uint32_t found = 0;
+    link->locator_requests++;
+    const int served = fuxi_servreg_serve((const uint8_t *)body, length, answer, sizeof answer, &answer_length,
+                                          wanted, sizeof wanted, &found);
+    if (!served) {
+        printf("FUXI_MODEM: the locator was sent %u bytes it cannot answer\n", length);
+        return;
+    }
+    printf("FUXI_MODEM: the locator: the modem asks where \"%s\" is, %u domain%s\n", wanted, found,
+           found == 1u ? "" : "s");
+    printf("FUXI_MODEM: the locator: the request is %u bytes:", length);
+    for (uint32_t i = 0; i < length && i < 64u; ++i) printf(" %02x", ((const uint8_t *)body)[i]);
+    printf("\n");
+    printf("FUXI_MODEM: the locator: the answer is %u bytes:", answer_length);
+    for (uint32_t i = 0; i < answer_length && i < 96u; ++i) printf(" %02x", answer[i]);
+    printf("\n");
+    if (qrtr_send_data(&link->qrtr, FUXI_LOCATOR_PORT, src_node, src_port, answer, answer_length)) {
+        snprintf(link->last_error, sizeof link->last_error, "the locator's answer was refused");
+        return;
+    }
+    link->locator_answered++;
+}
+
+/* Announces the locator to the peer: a NEW_SERVER naming the service, the version and instance it is
+   published under, and the local port it is served on.
+ *
+   The announcement goes to the node the peer's HELLO named, on the peer's control port. The peer reads the
+   command word out of the body and not out of the header's type field, the same way it reads the HELLO's.
+ *
+   Returns 0 when the announcement went out. */
+static int fuxi_announce_locator(fuxi_modem_link *link, uint32_t node)
+{
+    if (qrtr_send_new_server(&link->qrtr, node, FUXI_LOCATOR_SERVICE, FUXI_LOCATOR_VERSION, FUXI_LOCATOR_INSTANCE,
+                             FUXI_LOCATOR_PORT)) {
+        snprintf(link->last_error, sizeof link->last_error, "the locator's announcement was refused");
+        return -1;
+    }
+    link->locator_announces++;
+    /* The peer's HELLO count this announcement answers. The next HELLO moves the count past it, and that is
+       what makes the announcement go out again. */
+    link->locator_hello_at = link->qrtr.hellos;
+    printf("FUXI_MODEM: the locator was announced: service 0x%02x version %u instance %u, on port %u, to node %u\n",
+           FUXI_LOCATOR_SERVICE, FUXI_LOCATOR_VERSION, FUXI_LOCATOR_INSTANCE, FUXI_LOCATOR_PORT, node);
+    return 0;
 }
 
 /* Dumps one received QRTR packet, header and body, so the wire can be read off the log. */
@@ -340,6 +419,22 @@ void fuxi_modem_poll(void)
     /* The answer to the modem's HELLO is owed until the link has room for it: the remote's receive intent is still
        held by the packet that carried the HELLO. */
     if (link->qrtr.hello_reply_owed) qrtr_flush_hello_reply(&link->qrtr);
+    /* The service registry's locator is announced to the modem, once the link is up and again on every
+       router HELLO.
+     *
+     * The modem waits for two AP-side services before it brings its stack up, and the locator is one of them.
+     * It learns of the service only from the announcement, so an announcement that is not repeated on the
+     * peer's next HELLO leaves the peer without it: the peer sends HELLO again whenever it (re)opens its
+     * link, and answers it with the services it wants. */
+    if (link->ready && link->qrtr.remote_node_known) {
+        if (!link->locator_announced) {
+            /* A refused announcement is tried again on the next poll: the link had no room, and the flag is
+               only set once the announcement has actually gone out. */
+            if (fuxi_announce_locator(link, link->qrtr.remote_node) == 0) link->locator_announced = 1;
+        } else if (link->qrtr.hellos > link->locator_hello_at) {
+            fuxi_announce_locator(link, link->qrtr.remote_node);
+        }
+    }
     /* The bridge is published once the channel is up. It has to be published after, not before: the bridge's clients
        are bound to the services the modem announces, and it needs this side's send hook to reach them. Until the
        channel is up there is no route to the modem at all, so a bridge published earlier could only fail. */
@@ -533,6 +628,9 @@ void fuxi_modem_status(fuxi_modem_link_status *status)
     status->qrtr_tx_pending = link->qrtr.flow[0].pending;
     status->qrtr_resumes_sent = link->qrtr.resumes_sent;
     status->qrtr_resumes_received = link->qrtr.resumes_received;
+    status->locator_announces = link->locator_announces;
+    status->locator_requests = link->locator_requests;
+    status->locator_answered = link->locator_answered;
     if (link->channel) {
         for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k) {
             if (!link->channel->remote[k].valid) continue;
@@ -555,6 +653,9 @@ void fuxi_modem_report(unsigned second)
     printf("FUXI modem: %u s: link %s, QRTR tx %u rx %u again %u, servers %u, glink tx %u rx %u\n", second,
            link->ready ? "up" : "down", link->tx_packets, link->rx_packets, link->tx_again, link->qrtr.servers,
            link->glink.tx_messages, link->glink.rx_messages);
+    /* The locator's own counts: how often it was announced, and what the modem asked of it. */
+    printf("FUXI modem: %u s: the locator was announced %u times, took %u requests and answered %u\n", second,
+           link->locator_announces, link->locator_requests, link->locator_answered);
     if (link->last_error[0]) printf("FUXI modem: last error: %s\n", link->last_error);
 }
 
