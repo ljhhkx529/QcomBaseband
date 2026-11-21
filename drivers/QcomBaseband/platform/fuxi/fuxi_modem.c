@@ -45,6 +45,19 @@
    is 1 and the Trogdor reference port uses the same; the modem addresses the AP by it. */
 #define FUXI_QRTR_LOCAL_NODE QRTR_LOCAL_NODE
 
+/* How many milliseconds pass between the wildcard service lookups. A service the modem registers later is only
+   found by asking again, because the name service does not announce what appears later. */
+#define kWildcardEveryMs 2000u
+
+/* The milliseconds since the boot, the way the bridge counts them (coachz_baseband.cpp's bb_now_ms). */
+static uint32_t fuxi_modem_now_ms(void)
+{
+    uint64_t ticks, ns;
+    clock_get_uptime(&ticks);
+    absolutetime_to_nanoseconds(ticks, &ns);
+    return (uint32_t)(ns / 1000000u);
+}
+
 /* What the board must hand the adapter before it can start. */
 typedef struct {
     /* The SMEM window, already mapped. */
@@ -84,6 +97,18 @@ typedef struct {
     uint32_t qrtr_remote_node, qrtr_hello_reply_node, qrtr_hello_reply_port;
     uint8_t qrtr_hello_reply_owed, qrtr_remote_node_known;
     uint32_t glink_remote_intents;  /* the receive intents the modem granted us */
+    uint32_t glink_remote_busy;     /* the ones still held, so the credit left is the difference */
+    /* The credit on the link and what it is spent on. */
+    uint32_t glink_no_intent, glink_intent_too_small, glink_intent_requested, glink_rx_done;
+    /* The service lookups that went out. The modem only publishes the services it is asked about, so a lookup
+       that never went out is a service list that never arrives. */
+    uint32_t qrtr_lookups;
+    /* The lookups the modem answered. A lookup it ignored is not counted, so a count that stays behind the number
+       that went out says the modem did not answer it. */
+    uint32_t qrtr_lookups_answered;
+    /* The QRTR flow control: the DATA packets the peer has not credited yet, and the RESUME_TX packets sent and
+       received. A peer that runs out of credit stops answering, and the credit comes back with RESUME_TX. */
+    uint32_t qrtr_tx_pending, qrtr_resumes_sent, qrtr_resumes_received;
     char last_unknown[QCOM_GLINK_NAME];
 } fuxi_modem_link_status;
 
@@ -106,6 +131,18 @@ typedef struct {
     uint8_t hello_sent;
     /* The bridge has been published. It is published once, when the channel comes up. */
     uint8_t published;
+    /* The service lookup has been sent. The modem answers it with the services it has. */
+    uint8_t lookup_sent;
+    /* How many of the named lookups went out. */
+    uint32_t wanted_done;
+    /* How many lookups the link refused, so they are tried again. */
+    uint32_t lookup_again;
+    /* How many lookups went out. */
+    uint32_t lookup_packets;
+    /* When the wildcard lookup was last asked, in milliseconds. The poll runs far more often than that, so the
+       re-ask is counted in time and not in polls. */
+    uint32_t wildcard_at;
+
 } fuxi_modem_link;
 
 static fuxi_modem_link fuxi_link;
@@ -200,6 +237,16 @@ static void fuxi_glink_state(void *context, QcomGlinkChannel *channel, int up)
     if (up) fuxi_link.ready = 1;
 }
 
+/* The bytes that go out on the wire. The receive-side trace shows what the modem sent; this one shows what we sent,
+   which is the only way to tell a lookup the modem ignored from a lookup that never left. */
+static void fuxi_trace_qrtr_tx(void *context, const uint8_t *bytes, uint32_t count)
+{
+    (void)context;
+    printf("FUXI_MODEM: the qrtr packet we sent is %u bytes:", count);
+    for (uint32_t i = 0; i < count && i < 64; ++i) printf(" %02x", bytes[i]);
+    printf("\n");
+}
+
 /* Sends the first HELLO, once there is a channel to send it on. */
 static void fuxi_send_hello(void)
 {
@@ -274,6 +321,7 @@ int fuxi_modem_start(const fuxi_modem_link_config *config)
     qrtr_init(&link->qrtr, FUXI_QRTR_LOCAL_NODE, fuxi_qrtr_send, fuxi_qrtr_new_server, link);
     qrtr_set_data_handler(&link->qrtr, fuxi_qrtr_data);
     qrtr_set_trace(&link->qrtr, fuxi_trace_qrtr, 0);
+    qrtr_set_trace_tx(&link->qrtr, fuxi_trace_qrtr_tx, 0);
     /* The HELLO is owed, not sent: the GLINK channel is only up once the modem opens it, and a HELLO sent before
        that is dropped by the link with nothing to show for it. The owner's poll sends it as soon as the channel is
        up. */
@@ -299,19 +347,118 @@ void fuxi_modem_poll(void)
         link->published = 1;
         fuxi_modem_publish();
     }
+    /* The services the bridge wants, asked for by name. The modem does not publish its whole list on its own: it
+       answers a lookup with the services that match (Linux net/qrtr/ns.c, ctrl_cmd_new_lookup and lookup_notify),
+       and a client that never asks never learns. The lookup is asked for once the modem's node is known, because the
+       answer is addressed to the node the lookup came from. */
+    if (link->ready && link->qrtr.remote_node_known && !link->lookup_sent) {
+        link->lookup_sent = 1;
+        /* Service 0 and instance 0 match anything, so this one lookup asks for the whole list
+           (Linux ns.c: `if (lookup->service && lookup->service != service) continue;`). */
+        if (qrtr_send_lookup(&link->qrtr, 0, 0, 0)) {
+            snprintf(link->last_error, sizeof link->last_error, "the service lookup was refused");
+        } else {
+            link->lookup_packets++;
+        }
+    }
+    /* The wildcard lookup is asked again and again, on both of the nodes the peer named.
+     *
+     * Two facts from the wire make this necessary. The modem's answer to the wildcard lookup was two services
+     * and then nothing: no empty NEW_SERVER, which upstream uses to end a listing. So the listing was cut short,
+     * and a service that the modem registers a moment later is not in it. And the modem's own name service runs on
+     * the node its HELLO body names, not the node its header names, so a lookup that goes only to the header's
+     * node does not reach the whole list.
+     *
+     * The re-ask is the only way to learn a service that appears later: a service the bridge has not seen cannot
+     * be asked for by name, and the name service does not announce what appears later. It is asked every
+     * kWildcardEvery polls, which is a few seconds, so a service that shows up is bound within a few seconds of
+     * its appearing. */
+    if (link->ready && link->qrtr.remote_node_known && link->lookup_sent) {
+        const uint32_t now = fuxi_modem_now_ms();
+        if (!link->wildcard_at) link->wildcard_at = now;
+        if (now - link->wildcard_at >= kWildcardEveryMs) {
+            link->wildcard_at = now;
+            const uint32_t nodes[2] = { link->qrtr.remote_node, link->qrtr.peer_node };
+            for (unsigned k = 0; k < 2; ++k) {
+                if (k == 1 && (!link->qrtr.peer_node_known || link->qrtr.peer_node == link->qrtr.remote_node))
+                    continue;
+                if (qrtr_send_lookup_to(&link->qrtr, nodes[k], 0, 0, 0) == 0) link->lookup_packets++;
+                else link->lookup_again++;
+            }
+        }
+    }
+    /* The wildcard lookup only reaches what the modem publishes on its own initiative. The service the bridge
+       needs is asked for by name: the lookup's service id and the version in the low byte of the instance word
+       (Linux drivers/soc/qcom/qmi_interface.c, qmi_send_new_lookup). The names are swept one after another, and
+       each is asked on both of the nodes the peer named: the one in its HELLO header and the one in its HELLO
+       body, which are not the same. A service the peer holds on the body's node is not reachable from the
+       header's node, so a lookup that goes only to the header's node finds nothing.
+
+       The instance word is the other half of the question. Linux's name service matches it loosely
+       (Linux net/qrtr/ns.c, server_match: a lookup with instance 0 matches any instance), but the modem's
+       answer to a wildcard lookup shows its own instances, and a named lookup with instance 0 was answered
+       with silence. So each name is asked twice: once with the instance the peer announced and once with
+       instance 0. The two controls, 0x42 and 0x2b, are asked with the instance the peer announced, because
+       they are the ones whose instances are known. */
+    static const struct {
+        uint32_t service, version, instance;
+    } fuxi_wanted[] = {
+        {0x40u, 0u, 0u},    /* SERVREG_LOC: the locator, the one service that lists the modem's services */
+        {0x40u, 1u, 0u},
+        {0x40u, 1u, 1u},
+        {0x42u, 1u, 180u},  /* SERVREG_NOTIF, the instance the peer announced */
+        {0x2bu, 2u, 18u},   /* SSCTL, the instance the peer announced */
+        {0x42u, 0u, 0u},    /* the same name with instance 0 */
+        {0x2bu, 0u, 0u},
+        {0x0bu, 0u, 0u},    /* UIM: the card and its files */
+        {0x0bu, 1u, 0u},
+        {0x0bu, 1u, 2u},
+        {0x03u, 0u, 0u},    /* NAS: the network and the signal */
+        {0x03u, 1u, 0u},
+        {0x01u, 0u, 0u},    /* WDS: the data service */
+        {0x02u, 0u, 0u},    /* DMS */
+        {0xe2u, 0u, 0u},    /* BSP */
+    };
+    if (link->ready && link->qrtr.remote_node_known && link->lookup_sent &&
+        link->wanted_done < sizeof fuxi_wanted / sizeof fuxi_wanted[0]) {
+        const uint32_t service = fuxi_wanted[link->wanted_done].service;
+        const uint32_t version = fuxi_wanted[link->wanted_done].version;
+        const uint32_t instance = fuxi_wanted[link->wanted_done].instance;
+        /* Each lookup is asked on both nodes, one per poll, so the link has room and the log says which
+           node was asked. */
+        uint32_t node = link->qrtr.remote_node;
+        if (link->qrtr.peer_node_known && link->qrtr.peer_node != link->qrtr.remote_node &&
+            (link->wanted_done & 1u))
+            node = link->qrtr.peer_node;
+        if (qrtr_send_lookup_to(&link->qrtr, node, service, version, instance) == 0) {
+            link->lookup_packets++;
+            printf("FUXI_MODEM: the lookup for service 0x%02x version %u instance %u went out to node %u\n",
+                   service, version, instance, node);
+            link->wanted_done++;
+        } else {
+            /* The link had no room. The same lookup is tried again on the next poll. */
+            link->lookup_again++;
+        }
+    }
     extern void coachz_baseband_poll(void);
     coachz_baseband_poll();
 }
 
 /* The bridge's send hook: one QMI message for a client. The local port is the client's own port, because the modem
-   routes the answer back by it; the node and port are the service's, from the modem's NEW_SERVER. */
-static void fuxi_bridge_send(uint32_t local_port, uint32_t node, uint32_t port, const void *message, uint32_t length)
+   routes the answer back by it; the node and port are the service's, from the modem's NEW_SERVER.
+
+   A refusal is reported back, so the bridge tries the message again. The QRTR layer refuses a DATA packet when
+   the peer is out of credit, and the credit comes back with a RESUME_TX; a message dropped here would be lost
+   with nothing on the log to say so. */
+static int fuxi_bridge_send(uint32_t local_port, uint32_t node, uint32_t port, const void *message, uint32_t length)
 {
     fuxi_modem_link *link = &fuxi_link;
-    if (!link->channel) return;
+    if (!link->channel) return -1;
     if (qrtr_send_data(&link->qrtr, local_port, node, port, message, length)) {
         snprintf(link->last_error, sizeof link->last_error, "QRTR data to %u:%u refused", node, port);
+        return -1;
     }
+    return 0;
 }
 
 /* The bridge's release hook: a client that goes away is announced to the modem, so it stops sending to that port. */
@@ -326,7 +473,7 @@ static void fuxi_bridge_del_client(uint32_t local_port)
    /chosen/coachz-baseband says so. */
 void fuxi_modem_publish(void)
 {
-    extern void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t),
+    extern void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t),
                                           void (*del_client)(uint32_t));
     coachz_baseband_configure(fuxi_bridge_send, fuxi_bridge_del_client);
 }
@@ -374,9 +521,27 @@ void fuxi_modem_status(fuxi_modem_link_status *status)
     status->qrtr_hello_reply_owed = link->qrtr.hello_reply_owed;
     status->qrtr_remote_node_known = link->qrtr.remote_node_known;
     status->glink_remote_intents = 0;
+    status->glink_remote_busy = 0;
+    status->glink_no_intent = link->glink.no_intent;
+    status->glink_intent_too_small = link->glink.intent_too_small;
+    status->glink_intent_requested = link->glink.intent_requested;
+    status->glink_rx_done = link->glink.rx_done;
+    status->qrtr_lookups = link->lookup_packets;
+    status->qrtr_lookups_answered = link->qrtr.lookups_answered;
+    /* The flow control. A peer that is out of credit stops answering, so the count of outstanding packets and the
+       number of RESUME_TX packets sent and received say whether the link is waiting for a credit. */
+    status->qrtr_tx_pending = link->qrtr.flow[0].pending;
+    status->qrtr_resumes_sent = link->qrtr.resumes_sent;
+    status->qrtr_resumes_received = link->qrtr.resumes_received;
     if (link->channel) {
-        for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k)
-            if (link->channel->remote[k].valid) status->glink_remote_intents++;
+        for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k) {
+            if (!link->channel->remote[k].valid) continue;
+            status->glink_remote_intents++;
+            /* An intent the remote has not told us it is done with is still held: it cannot be sent into again.
+               The count of held intents is the credit the remote has left, which is what says whether the link is
+               out of room or the modem has stopped answering. */
+            if (link->channel->remote[k].busy) status->glink_remote_busy++;
+        }
     }
     for (unsigned b = 0; b < QCOM_GLINK_NAME; ++b) status->last_unknown[b] = link->glink.last_unknown[b];
 }

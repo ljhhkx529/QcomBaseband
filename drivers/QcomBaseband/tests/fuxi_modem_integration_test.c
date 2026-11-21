@@ -300,7 +300,7 @@ static void host_kick(void *context)
 /* The bridge hooks the adapter calls: they are not what this test is about, so they only count. */
 static int bridge_configured;
 static uint32_t bridge_new_servers;
-void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t),
+void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t),
                                void (*del_client)(uint32_t))
 {
     (void)send; (void)del_client;

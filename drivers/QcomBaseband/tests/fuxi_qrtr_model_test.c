@@ -240,6 +240,132 @@ static void test_peer_hello(void)
     CHECK(rd32(sent[0] + QRTR_HDR_LEN + 4) == 7);
 }
 
+/* The lookup: the AP asks the modem which services it has. The modem answers with a NEW_SERVER per service and
+   with an empty NEW_SERVER at the end of the list. */
+static void test_lookup(void)
+{
+    static struct qrtr_state q;
+    uint8_t body[QRTR_CTRL_LEN], packet[256], peer_body[QRTR_CTRL_LEN];
+    qrtr_init(&q, 7, link_send, link_server, 0);
+    sent_count = 0;
+    qrtr_send(&q, 3, QRTR_PORT_CTRL, QRTR_TYPE_HELLO, 0, 0);
+
+    /* Before the peer's HELLO the modem's node is not known, so the lookup goes to the broadcast node. */
+    CHECK(qrtr_send_lookup(&q, 0, 0, 0) == 0);
+    CHECK(sent_count == 2);
+    CHECK(last_dst_node == QRTR_NODE_BCAST);
+    CHECK(last_dst_port == QRTR_PORT_CTRL);
+    /* The body is a whole qrtr_ctrl_pkt: the command word, then the service and the instance out of the union. */
+    CHECK(rd32(sent[1] + QRTR_HDR_LEN + 0) == QRTR_TYPE_NEW_LOOKUP);
+    CHECK(rd32(sent[1] + QRTR_HDR_LEN + 4) == 0);
+    CHECK(rd32(sent[1] + QRTR_HDR_LEN + 8) == 0);
+    CHECK(sent_len[1] == QRTR_HDR_LEN + QRTR_CTRL_LEN);
+
+    /* A lookup for one service carries the service id and the version in the low byte of the instance word
+       (Linux drivers/soc/qcom/qmi_interface.c, qmi_send_new_lookup). */
+    CHECK(qrtr_send_lookup(&q, 0x0b, 0x12, 0x03) == 0);
+    CHECK(rd32(sent[2] + QRTR_HDR_LEN + 4) == 0x0b);
+    CHECK(rd32(sent[2] + QRTR_HDR_LEN + 8) == 0x0312);
+
+    /* The peer's HELLO body carries a node and a port of its own, next to the command word. The header names
+       a different node. Both are kept: a service the peer holds on the body's node is not reachable from the
+       header's node. */
+    memset(peer_body, 0, sizeof peer_body);
+    wr32(peer_body + 0, QRTR_TYPE_HELLO);
+    wr32(peer_body + 4, 9);
+    wr32(peer_body + 8, 10);
+    uint32_t n = build(packet, QRTR_TYPE_HELLO, 9, QRTR_PORT_CTRL, peer_body, sizeof peer_body);
+    qrtr_receive(&q, packet, n);
+    CHECK(q.remote_node == 9 && q.remote_node_known);
+    CHECK(q.peer_node == 9 && q.peer_node_known && q.peer_port == 10);
+    CHECK(qrtr_send_lookup(&q, 0, 0, 0) == 0);
+    CHECK(last_dst_node == 9);
+
+    /* A lookup can be sent to a named node, which is how a service the peer holds on another node is asked for. */
+    CHECK(qrtr_send_lookup_to(&q, 7907, 0x0b, 0, 0) == 0);
+    CHECK(last_dst_node == 7907);
+    CHECK(last_dst_port == QRTR_PORT_CTRL);
+    CHECK(rd32(sent[sent_count - 1] + QRTR_HDR_LEN + 4) == 0x0b);
+
+    /* The modem's answer: one NEW_SERVER per service, then the empty one that ends the list. */
+    last_server_service = 0;
+    wr32(body + 0, QRTR_TYPE_NEW_SERVER);
+    wr32(body + 4, 0x0b);           /* UIM */
+    wr32(body + 8, 0x02);
+    wr32(body + 12, 0);             /* node */
+    wr32(body + 16, 0x05);          /* port */
+    n = build(packet, QRTR_TYPE_NEW_SERVER, 0, QRTR_PORT_CTRL, body, sizeof body);
+    qrtr_receive(&q, packet, n);
+    CHECK(last_server_service == 0x0b);
+    CHECK(q.servers == 1);
+    CHECK(qrtr_lookup(&q, 0x0b) == 0x05);
+
+    /* The empty NEW_SERVER: service 0 and port 0. It is the end of the listing, not a service
+       (Linux net/qrtr/ns.c, lookup_notify: "Empty notification, to indicate end of listing"). */
+    wr32(body + 4, 0);
+    wr32(body + 16, 0);
+    n = build(packet, QRTR_TYPE_NEW_SERVER, 0, QRTR_PORT_CTRL, body, sizeof body);
+    qrtr_receive(&q, packet, n);
+    CHECK(q.servers == 1);
+    /* Two answers: the service the modem published and the end of the listing. Both are answers, so a modem
+       that answers with services and never ends its listing still moves the counter. */
+    CHECK(q.lookups_answered == 2);
+}
+
+/* The flow control of upstream's net/qrtr/af_qrtr.c: the peer stops answering once its high watermark of
+   outstanding DATA packets is reached, and the credit comes back with a RESUME_TX. Without this the link goes
+   quiet in both directions after ten packets, with nothing dropped on our side. */
+static void test_flow_control(void)
+{
+    static struct qrtr_state q;
+    uint8_t packet[256], body[QRTR_CTRL_LEN];
+    qrtr_init(&q, 7, link_send, link_server, 0);
+    sent_count = 0;
+    qrtr_send(&q, 3, QRTR_PORT_CTRL, QRTR_TYPE_HELLO, 0, 0);
+
+    /* The confirm_rx flag goes on the packet that crosses the low watermark, and on no other. */
+    for (uint32_t i = 1; i <= QRTR_TX_FLOW_LOW; i++) {
+        CHECK(qrtr_send_data(&q, 0x4100, 9, 0x05, "hi", 2) == 0);
+        CHECK(rd32(sent[sent_count - 1] + 16) == (i == QRTR_TX_FLOW_LOW ? 1u : 0u));
+    }
+    CHECK(q.flow[0].pending == QRTR_TX_FLOW_LOW);
+
+    /* The high watermark refuses further packets rather than sending them into a peer that has no room. */
+    for (uint32_t i = QRTR_TX_FLOW_LOW; i < QRTR_TX_FLOW_HIGH; i++)
+        CHECK(qrtr_send_data(&q, 0x4100, 9, 0x05, "hi", 2) == 0);
+    CHECK(q.flow[0].pending == QRTR_TX_FLOW_HIGH);
+    CHECK(qrtr_send_data(&q, 0x4100, 9, 0x05, "hi", 2) == -1);
+    CHECK(q.flow[0].pending == QRTR_TX_FLOW_HIGH);
+
+    /* The peer's RESUME_TX frees the credit for the destination its body names. */
+    memset(body, 0, sizeof body);
+    wr32(body + 0, QRTR_TYPE_RESUME_TX);
+    wr32(body + 4, 9);             /* the destination we addressed */
+    wr32(body + 8, 0x05);          /* its port */
+    uint32_t n = build(packet, QRTR_TYPE_RESUME_TX, 9, QRTR_PORT_CTRL, body, sizeof body);
+    qrtr_receive(&q, packet, n);
+    CHECK(q.resumes_received == 1);
+    CHECK(q.flow[0].pending == 0);
+    CHECK(qrtr_send_data(&q, 0x4100, 9, 0x05, "hi", 2) == 0);
+
+    /* The peer's own credit: a DATA packet with the confirm_rx flag makes us answer with a RESUME_TX. The body
+       names where the flagged packet was addressed, which is the destination the sender has to free (upstream's
+       qrtr_send_resume_tx puts cb->dst_node and cb->dst_port in the body). The RESUME_TX itself goes back to where
+       the packet came from. */
+    memset(body, 0, sizeof body);
+    n = build(packet, QRTR_TYPE_DATA, 9, 0x05, body, 0);
+    wr32(packet + 16, 1);          /* confirm_rx */
+    wr32(packet + 24, 7);          /* the node we addressed the packet to */
+    wr32(packet + 28, 0x4100);     /* the port we addressed it to */
+    qrtr_receive(&q, packet, n);
+    CHECK(q.resumes_sent == 1);
+    CHECK(rd32(sent[sent_count - 1] + QRTR_HDR_LEN + 0) == QRTR_TYPE_RESUME_TX);
+    CHECK(rd32(sent[sent_count - 1] + QRTR_HDR_LEN + 4) == 7);
+    CHECK(rd32(sent[sent_count - 1] + QRTR_HDR_LEN + 8) == 0x4100);
+    CHECK(last_dst_node == 9);
+    CHECK(last_dst_port == 0x05);
+}
+
 int main(void)
 {
     test_header();
@@ -249,6 +375,8 @@ int main(void)
     test_new_server();
     test_data();
     test_peer_hello();
+    test_lookup();
+    test_flow_control();
     if (failures) { printf("%d failures\n", failures); return 1; }
     printf("qrtr model: ok\n");
     return 0;

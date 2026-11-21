@@ -43,6 +43,10 @@ static struct qrtr_server *server_find(struct qrtr_state *q, uint32_t service, u
 
 static struct qrtr_server *server_add(struct qrtr_state *q, uint32_t service, uint32_t instance, uint32_t node, uint32_t port)
 {
+    /* A service of 0 or a port of 0 is refused (Linux net/qrtr/ns.c, server_add: `if (!service || !port) return
+       NULL;`). The empty NEW_SERVER that ends a lookup listing carries service 0, so it is not a service and must
+       not be added as one. */
+    if (!service || !port) return 0;
     struct qrtr_server *s = server_find(q, service, instance);
     if (s) {
         s->node = node;
@@ -91,6 +95,13 @@ void qrtr_set_trace(struct qrtr_state *q, void (*trace)(void *context, const uin
     q->trace_context = context;
 }
 
+void qrtr_set_trace_tx(struct qrtr_state *q, void (*trace)(void *context, const uint8_t *bytes, uint32_t length),
+                       void *context)
+{
+    q->trace_tx = trace;
+    q->trace_tx_context = context;
+}
+
 int qrtr_send(struct qrtr_state *q, uint32_t dst_node, uint32_t dst_port, uint32_t type, const void *body, uint32_t length)
 {
     return qrtr_send_from(q, QRTR_PORT_CTRL, dst_node, dst_port, type, body, length);
@@ -131,9 +142,87 @@ static void build_ctrl_body(uint8_t *body, uint32_t cmd, uint32_t node, uint32_t
     wr32(body + 8, port);
 }
 
+int qrtr_send_lookup(struct qrtr_state *q, uint32_t service, uint32_t version, uint32_t instance)
+{
+    uint8_t body[QRTR_CTRL_LEN];
+    /* The body is a whole qrtr_ctrl_pkt: the command word and the server union. The peer reads the command word
+       and then the service and the instance out of the union (Linux net/qrtr/ns.c, ctrl_cmd_new_lookup). */
+    memset(body, 0, sizeof body);
+    wr32(body + 0, QRTR_TYPE_NEW_LOOKUP);
+    wr32(body + 4, service);
+    /* The instance word holds the version in its low byte and the instance in its high byte
+       (Linux drivers/soc/qcom/qmi_interface.c, qmi_send_new_lookup). */
+    wr32(body + 8, (version & 0xffu) | ((instance & 0xffu) << 8));
+    /* The lookup goes to the control port of the node we know: the modem's node id if its HELLO has arrived,
+       otherwise the broadcast node. The peer answers on the control port. */
+    const uint32_t node = q->remote_node_known ? q->remote_node : QRTR_NODE_BCAST;
+    return qrtr_send(q, node, QRTR_PORT_CTRL, QRTR_TYPE_NEW_LOOKUP, body, sizeof body);
+}
+
+int qrtr_send_lookup_to(struct qrtr_state *q, uint32_t node, uint32_t service, uint32_t version, uint32_t instance)
+{
+    uint8_t body[QRTR_CTRL_LEN];
+    memset(body, 0, sizeof body);
+    wr32(body + 0, QRTR_TYPE_NEW_LOOKUP);
+    wr32(body + 4, service);
+    wr32(body + 8, (version & 0xffu) | ((instance & 0xffu) << 8));
+    return qrtr_send(q, node, QRTR_PORT_CTRL, QRTR_TYPE_NEW_LOOKUP, body, sizeof body);
+}
+
+/* The flow of one destination: the DATA packets the peer has not credited yet. Upstream keys the flow on the
+   destination's node and port (Linux net/qrtr/af_qrtr.c, qrtr_tx_wait: `key = dest_node << 32 | dest_port`). */
+static struct qrtr_flow *flow_find(struct qrtr_state *q, uint32_t node, uint32_t port, int create)
+{
+    struct qrtr_flow *free_slot = 0;
+    for (uint32_t i = 0; i < QRTR_MAX_FLOWS; i++) {
+        struct qrtr_flow *f = &q->flow[i];
+        if (!f->used) {
+            if (!free_slot) free_slot = f;
+            continue;
+        }
+        if (f->node == node && f->port == port) return f;
+    }
+    if (!create || !free_slot) return 0;
+    free_slot->used = 1;
+    free_slot->node = node;
+    free_slot->port = port;
+    free_slot->pending = 0;
+    return free_slot;
+}
+
+/* The peer freed the credit for one destination. The RESUME_TX body names that destination, and the count for it
+   starts over (Linux net/qrtr/af_qrtr.c, qrtr_tx_resume: `flow->pending = 0`). */
+int qrtr_resume_tx(struct qrtr_state *q, uint32_t node, uint32_t port)
+{
+    struct qrtr_flow *f = flow_find(q, node, port, 0);
+    if (f) f->pending = 0;
+    q->resumes_received++;
+    return 1;
+}
+
+/* Our credit is back: the peer asked for a RESUME_TX, so we tell it we may receive again.
+
+   Upstream sends the RESUME_TX from the port the flagged packet was addressed to, to the sender's own node and
+   port, and the body carries the destination of the flagged packet (Linux net/qrtr/af_qrtr.c,
+   qrtr_send_resume_tx: `pkt->client.node = cb->dst_node; pkt->client.port = cb->dst_port`, and the packet goes
+   from the local address to the remote one). The sender frees its flow by that body, so the body has to name the
+   destination the sender addressed its packet to.
+
+   peer_node and peer_port are where the packet came from; our_node and our_port are where it was addressed. */
+int qrtr_send_resume_tx(struct qrtr_state *q, uint32_t peer_node, uint32_t peer_port, uint32_t our_node, uint32_t our_port)
+{
+    uint8_t body[QRTR_CTRL_LEN];
+    memset(body, 0, sizeof body);
+    wr32(body + 0, QRTR_TYPE_RESUME_TX);
+    wr32(body + 4, our_node);
+    wr32(body + 8, our_port);
+    const int result = qrtr_send_from(q, our_port, peer_node, peer_port, QRTR_TYPE_RESUME_TX, body, sizeof body);
+    if (result == 0) q->resumes_sent++;
+    return result;
+}
+
 int qrtr_flush_hello_reply(struct qrtr_state *q)
 {
-    if (!q->hello_reply_owed) return 0;
     const int result = qrtr_send(q, q->hello_reply_node, q->hello_reply_port, QRTR_TYPE_HELLO, q->hello_reply_body,
                                  QRTR_CTRL_LEN);
     if (result == 0) {
@@ -176,14 +265,51 @@ int qrtr_send_from(struct qrtr_state *q, uint32_t src_port, uint32_t dst_node, u
     wr32(p + 4, type);
     wr32(p + 8, q->local_node);
     wr32(p + 12, src_port);
-    wr32(p + 16, 0);             /* confirm_rx */
+    /* The confirm_rx flag asks the peer for a RESUME_TX when it has room again. Upstream sets it on the DATA packet
+       that crosses the low watermark (Linux net/qrtr/af_qrtr.c, qrtr_tx_wait), and the peer stops answering once
+       its high watermark of outstanding packets is reached. */
+    uint32_t confirm_rx = 0;
+    struct qrtr_flow *flow = 0;
+    if (type == QRTR_TYPE_DATA) {
+        flow = flow_find(q, dst_node, dst_port, 1);
+        if (!flow) {
+            /* No room for another destination's flow: the packet is refused rather than sent unaccounted for. */
+            q->dropped++;
+            return -1;
+        }
+        if (flow->pending >= QRTR_TX_FLOW_HIGH) {
+            /* The peer is full. The packet waits for the RESUME_TX that frees the credit. */
+            q->dropped++;
+            return -1;
+        }
+        flow->pending++;
+        confirm_rx = flow->pending == QRTR_TX_FLOW_LOW;
+    }
+    wr32(p + 16, confirm_rx);
     wr32(p + 20, length);
     wr32(p + 24, dst_node);
     wr32(p + 28, dst_port);
     if (length && body) memcpy(p + QRTR_HDR_LEN, body, length);
     for (uint32_t i = length; i < padded; i++) p[QRTR_HDR_LEN + i] = 0;
+    /* The bytes that go out are shown before they are handed over: a lookup the peer ignored and a lookup that
+       never left look the same from the receive side. */
+    if (q->trace_tx) {
+        if (type_is_control(type)) {
+            if (q->traced_tx < 32) {
+                q->traced_tx++;
+                q->trace_tx(q->trace_tx_context, p, QRTR_HDR_LEN + padded);
+            }
+        } else if (q->traced_tx_data < 32) {
+            q->traced_tx_data++;
+            q->trace_tx(q->trace_tx_context, p, QRTR_HDR_LEN + padded);
+        }
+    }
     const int result = q->send(q->context, src_port, dst_node, dst_port, p, QRTR_HDR_LEN + padded);
-    if (result) return result;
+    if (result) {
+        /* The packet did not go out, so it does not count against the peer's credit: the peer never saw it. */
+        if (flow && flow->pending) flow->pending--;
+        return result;
+    }
     q->tx++;
     if (type == QRTR_TYPE_HELLO) q->hello_sent = 1;
     return 0;
@@ -199,10 +325,18 @@ void qrtr_receive(struct qrtr_state *q, const void *data, uint32_t length)
     q->rx++;
     /* Control packets are dumped in full, and data packets are not: the wire has to be readable off the log, and the
        control packets are the ones that carry the name service's state (which service, which instance, which node and
-       port). The dump is limited to the first few control packets so a busy link cannot flood the log. */
-    if (q->trace && type_is_control(rd32(p + 4)) && q->traced < 8) {
-        q->traced++;
-        q->trace(q->trace_context, p, length);
+       port). The dump is limited to the first few control packets so a busy link cannot flood the log. The limit is
+       32 because the startup sweep asks for several services by name and each answer is a control packet. */
+    if (q->trace) {
+        if (type_is_control(rd32(p + 4))) {
+            if (q->traced < 32) {
+                q->traced++;
+                q->trace(q->trace_context, p, length);
+            }
+        } else if (q->traced_data < 32) {
+            q->traced_data++;
+            q->trace(q->trace_context, p, length);
+        }
     }
     if (rd32(p + 0) != QRTR_PROTO_VER_1) {
         q->malformed++;
@@ -224,6 +358,14 @@ void qrtr_receive(struct qrtr_state *q, const void *data, uint32_t length)
         q->hello_received = 1;
         q->remote_node = src_node;
         q->remote_node_known = 1;
+        /* The peer's HELLO body carries a node and a port of its own, next to the command word. The header
+           names a different node. Both are kept: the lookup is tried on each in turn, because a service the
+           modem holds on the body's node is not reachable from the header's node. */
+        if (size >= QRTR_CTRL_LEN) {
+            q->peer_node = rd32(body + 4);
+            q->peer_port = rd32(body + 8);
+            q->peer_node_known = 1;
+        }
         /* The modem may announce its services in the same breath as its HELLO; answer and carry on. The answer is
            owed until the link takes it: the remote's receive intent is still held by the very packet that carried
            the HELLO, so the first attempt is usually refused. */
@@ -249,6 +391,16 @@ void qrtr_receive(struct qrtr_state *q, const void *data, uint32_t length)
             q->remote_node = node;
             q->remote_node_known = 1;
         }
+        /* The empty NEW_SERVER carries service 0 and port 0: it is the end of a lookup listing, not a service
+           (Linux net/qrtr/ns.c, lookup_notify: "Empty notification, to indicate end of listing"). */
+        if (!service || !port) {
+            q->lookups_answered++;
+            return;
+        }
+        /* A service the modem published is also an answer: the modem's name service answers a lookup with a
+           NEW_SERVER for each service it holds, and the listing ends with the empty one. The counter used to
+           move only for the empty one, so it stayed at zero on a modem that answers with services. */
+        q->lookups_answered++;
         if (!server_add(q, service, instance, node, port)) {
             q->dropped++;
             return;
@@ -264,14 +416,23 @@ void qrtr_receive(struct qrtr_state *q, const void *data, uint32_t length)
         server_remove(q, rd32(body + 4), rd32(body + 8));
         return;
     }
+    if (type == QRTR_TYPE_RESUME_TX) {
+        /* The peer says it may receive again. Its body names the destination whose credit is freed. */
+        if (size >= QRTR_CTRL_LEN) qrtr_resume_tx(q, rd32(body + 4), rd32(body + 8));
+        else q->malformed++;
+        return;
+    }
     if (type == QRTR_TYPE_DATA) {
+        /* The peer asked for a RESUME_TX when it gets this packet, so we tell it our side is free again. The
+           body names where we addressed the packet, which is the destination the sender has to free. */
+        if (rd32(p + 16)) qrtr_send_resume_tx(q, src_node, src_port, dst_node, dst_port);
         /* The bridge's own hook takes the payload. The destination port is the local client port the answer belongs
            to; the source node and port say who sent it. */
         if (q->data_fn) q->data_fn(q->context, dst_port, src_node, src_port, body, size);
         else q->dropped++;
         return;
     }
-    /* BYE, DEL_CLIENT, PING, RESUME_TX and the lookups need no answer here. */
+    /* BYE, DEL_CLIENT, PING and the lookups need no answer here. */
     (void)dst_node;
 }
 

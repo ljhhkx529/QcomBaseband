@@ -68,6 +68,16 @@ enum {
    addresses the AP by it. */
 #define QRTR_LOCAL_NODE 1u
 
+/* The flow control watermarks of upstream's net/qrtr/af_qrtr.c: QRTR_TX_FLOW_LOW and QRTR_TX_FLOW_HIGH. The
+   low watermark is the number of outstanding DATA packets at which the confirm_rx flag is set; the high
+   watermark is the number at which the sender must stop. */
+#define QRTR_TX_FLOW_LOW 5u
+#define QRTR_TX_FLOW_HIGH 10u
+
+/* How many destinations are tracked separately. Upstream keys the flow on the destination's node and port
+   (Linux net/qrtr/af_qrtr.c, qrtr_tx_wait: `key = dest_node << 32 | dest_port`). */
+#define QRTR_MAX_FLOWS 8u
+
 #define QRTR_MAX_SERVERS 64u
 /* The largest packet the layer assembles: the header plus a QMI SDU. */
 #define QRTR_MAX_PACKET 8192u
@@ -93,6 +103,12 @@ typedef void (*qrtr_data_fn)(void *context, uint32_t dst_port, uint32_t src_node
 struct qrtr_state {
     uint32_t local_node;              /* the node id the AP claims; the modem's is learned from its HELLO */
     uint32_t remote_node;             /* the modem's node id, from its HELLO or its NEW_SERVER */
+    /* The node and port the peer's HELLO body carried. Upstream's name service ignores the HELLO body
+       (Linux net/qrtr/ns.c, ctrl_cmd_hello just answers with the local servers), but the modem puts a node
+       and a port there that are not the ones its header names. They are kept so a lookup can be sent to
+       them: a service the modem holds on that node is not reachable from the header's node. */
+    uint32_t peer_node, peer_port;
+    uint8_t peer_node_known;
     uint8_t remote_node_known, hello_sent, hello_received;
     /* The reply to the peer's HELLO, owed when the link could not take it the first time. The link is busy more
        often than not right after the handshake: the remote's intent is still held by the packet that carried the
@@ -111,8 +127,36 @@ struct qrtr_state {
     /* An optional hook that sees the control packets as they arrive, so the wire can be read off the log. */
     void (*trace)(void *context, const uint8_t *bytes, uint32_t length);
     void *trace_context;
-    /* How many packets the trace hook has seen. The dump is limited, so a busy link cannot flood the log. */
+    /* An optional hook that sees the packets as they go out. The receive-side trace shows what the peer sent;
+       this one shows what we sent, which is the only way to tell a lookup the peer ignored from a lookup that
+       never left. */
+    void (*trace_tx)(void *context, const uint8_t *bytes, uint32_t length);
+    void *trace_tx_context;
+    /* How many packets the trace hook has seen. The dump is limited, so a busy link cannot flood the log. The
+       control packets and the data packets have their own budgets: the data packets are what the modem answers
+       in, and a run of data packets would otherwise use up the whole budget before the name service's state
+       showed up. */
     uint32_t traced;
+    uint32_t traced_data;
+    /* The same budget for the transmit-side trace. */
+    uint32_t traced_tx;
+    uint32_t traced_tx_data;
+    /* How many lookups the peer has answered. The end of a lookup listing is an empty NEW_SERVER, so this counts
+       the listings that are complete. */
+    uint32_t lookups_answered;
+    /* The flow control of upstream's net/qrtr/af_qrtr.c: a DATA packet that crosses the low watermark carries
+       the confirm_rx flag, and the peer answers it with RESUME_TX. Without this the peer stops answering after
+       its high watermark of outstanding packets, and the link goes quiet in both directions with nothing dropped
+       on our side.
+
+       The count is kept per destination, because upstream keys the flow on the destination's node and port
+       (qrtr_tx_wait: `key = dest_node << 32 | dest_port`) and a RESUME_TX names the destination it frees. */
+    struct qrtr_flow {
+        uint32_t node, port;
+        uint32_t pending;   /* the DATA packets the peer has not credited yet */
+        uint8_t used;
+    } flow[QRTR_MAX_FLOWS];
+    uint32_t resumes_sent, resumes_received;
     /* Counters for the log. */
     uint32_t tx, rx, dropped, malformed, hello_dropped;
     char last_error[96];
@@ -128,6 +172,9 @@ void qrtr_set_data_handler(struct qrtr_state *q, qrtr_data_fn data);
 /* Sets the hook that sees the first packets as they arrive. */
 void qrtr_set_trace(struct qrtr_state *q, void (*trace)(void *context, const uint8_t *bytes, uint32_t length),
                     void *context);
+/* Sets the hook that sees the packets as they go out. */
+void qrtr_set_trace_tx(struct qrtr_state *q, void (*trace)(void *context, const uint8_t *bytes, uint32_t length),
+                       void *context);
 /* Sends one QRTR packet: the 32-byte header and the payload. The source port is the control port. */
 int qrtr_send(struct qrtr_state *q, uint32_t dst_node, uint32_t dst_port, uint32_t type, const void *body, uint32_t length);
 /* Sends one QRTR packet from a given source port. */
@@ -137,9 +184,25 @@ int qrtr_send_from(struct qrtr_state *q, uint32_t src_port, uint32_t dst_node, u
 int qrtr_send_data(struct qrtr_state *q, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *body, uint32_t length);
 /* Tells the peer that a local client port is gone. */
 int qrtr_send_del_client(struct qrtr_state *q, uint32_t local_port);
+/* Asks the peer which services it has.
+ *
+ * The peer answers with NEW_SERVER for every service that matches and with an empty NEW_SERVER at the end of the
+ * list (Linux net/qrtr/ns.c, ctrl_cmd_new_lookup and lookup_notify). A service of 0 and an instance of 0 match
+ * anything, so that one lookup asks for the whole list (Linux ns.c: `if (lookup->service && lookup->service !=
+ * service) continue;`). The instance word holds the version in its low byte and the instance in its high byte
+ * (Linux drivers/soc/qcom/qmi_interface.c, qmi_send_new_lookup). */
+int qrtr_send_lookup(struct qrtr_state *q, uint32_t service, uint32_t version, uint32_t instance);
+/* The same lookup, sent to a named node. A peer can hold services on a node other than the one its header
+   names, and they are only reachable by asking that node. */
+int qrtr_send_lookup_to(struct qrtr_state *q, uint32_t node, uint32_t service, uint32_t version, uint32_t instance);
 /* Sends the reply to the peer's HELLO if it is still owed. The owner calls this whenever the link may have room
    again. Returns 1 when the reply went out. */
 int qrtr_flush_hello_reply(struct qrtr_state *q);
+/* The flow control of upstream's net/qrtr/af_qrtr.c. The peer stops answering once its high watermark of
+   outstanding DATA packets is reached, and says so with RESUME_TX; the peer asks for the same when our packet
+   carries the confirm_rx flag. */
+int qrtr_resume_tx(struct qrtr_state *q, uint32_t node, uint32_t port);
+int qrtr_send_resume_tx(struct qrtr_state *q, uint32_t peer_node, uint32_t peer_port, uint32_t our_node, uint32_t our_port);
 /* Hands one received QRTR packet (header and payload) to the protocol layer. */
 void qrtr_receive(struct qrtr_state *q, const void *data, uint32_t length);
 /* The service the modem announced with the lowest instance, or 0. */
