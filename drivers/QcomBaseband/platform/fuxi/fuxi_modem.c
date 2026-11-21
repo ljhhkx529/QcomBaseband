@@ -400,12 +400,15 @@ static int fuxi_announce_rmtfs(fuxi_modem_link *link, uint32_t node)
     return 0;
 }
 
-/* Dumps one received QRTR packet, header and body, so the wire can be read off the log. */
+/* Dumps one received QRTR packet, header and body, so the wire can be read off the log.
+ *
+ * The whole packet is printed, not the first 64 bytes: an RMTFS request carries its entries at the
+ * end, and a dump that stops before them does not show what the modem asked for. */
 static void fuxi_trace_qrtr(void *context, const uint8_t *bytes, uint32_t count)
 {
     (void)context;
     printf("FUXI_MODEM: the qrtr packet is %u bytes:", count);
-    for (uint32_t i = 0; i < count && i < 64; ++i) printf(" %02x", bytes[i]);
+    for (uint32_t i = 0; i < count; ++i) printf(" %02x", bytes[i]);
     printf("\n");
     if (count < QRTR_HDR_LEN) return;
     const uint32_t head[8] = {
