@@ -116,6 +116,9 @@ typedef struct {
     /* The QRTR flow control: the DATA packets the peer has not credited yet, and the RESUME_TX packets sent and
        received. A peer that runs out of credit stops answering, and the credit comes back with RESUME_TX. */
     uint32_t qrtr_tx_pending, qrtr_resumes_sent, qrtr_resumes_received;
+    /* The destinations the flow table is tracking. The modem opens a source port per stream, so this is the
+       number of streams, and it is the number the table has to hold. */
+    uint32_t qrtr_tx_flows;
     /* The service registry's locator: how often it was announced, how many requests it took and how many of
        them were answered. A request count that stays at zero says the modem never asked. */
     uint32_t locator_announces, locator_requests, locator_answered;
@@ -762,8 +765,18 @@ void fuxi_modem_status(fuxi_modem_link_status *status)
     status->qrtr_lookups = link->lookup_packets;
     status->qrtr_lookups_answered = link->qrtr.lookups_answered;
     /* The flow control. A peer that is out of credit stops answering, so the count of outstanding packets and the
-       number of RESUME_TX packets sent and received say whether the link is waiting for a credit. */
-    status->qrtr_tx_pending = link->qrtr.flow[0].pending;
+       number of RESUME_TX packets sent and received say whether the link is waiting for a credit.
+
+       The count is the sum over every destination, not one of them: the modem opens a source port per stream, so
+       the credit of one destination says nothing about the others. The number of destinations in use is reported
+       beside it, because a table that is filling up is what stops the answers from going out. */
+    status->qrtr_tx_pending = 0;
+    status->qrtr_tx_flows = 0;
+    for (uint32_t i = 0; i < QRTR_MAX_FLOWS; i++) {
+        if (!link->qrtr.flow[i].used) continue;
+        status->qrtr_tx_flows++;
+        status->qrtr_tx_pending += link->qrtr.flow[i].pending;
+    }
     status->qrtr_resumes_sent = link->qrtr.resumes_sent;
     status->qrtr_resumes_received = link->qrtr.resumes_received;
     status->locator_announces = link->locator_announces;

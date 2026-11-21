@@ -75,8 +75,12 @@ enum {
 #define QRTR_TX_FLOW_HIGH 10u
 
 /* How many destinations are tracked separately. Upstream keys the flow on the destination's node and port
-   (Linux net/qrtr/af_qrtr.c, qrtr_tx_wait: `key = dest_node << 32 | dest_port`). */
-#define QRTR_MAX_FLOWS 8u
+   (Linux net/qrtr/af_qrtr.c, qrtr_tx_wait: `key = dest_node << 32 | dest_port`).
+
+   The modem opens a new source port for every stream it starts, so the destinations come and go: the seven
+   RMTFS requests of 2026-11-22 came from seven ports. The table is therefore larger than the number of ports
+   the modem was seen to use, and a slot whose credit is all back is reused rather than the packet refused. */
+#define QRTR_MAX_FLOWS 32u
 
 #define QRTR_MAX_SERVERS 64u
 /* The largest packet the layer assembles: the header plus a QMI SDU. */

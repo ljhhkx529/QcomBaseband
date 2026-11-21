@@ -8,7 +8,9 @@ static int failures;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
 
 /* What the link saw: the packets the protocol layer wrote, kept as the bytes that went out. */
-#define MAX_PACKETS 16
+/* The buffer holds every packet a test sends, so it has to be as wide as the flow table: the capacity test
+   sends one packet per destination, and a destination is a source port the modem may pick. */
+#define MAX_PACKETS 128
 static uint8_t sent[MAX_PACKETS][256];
 static uint32_t sent_len[MAX_PACKETS], sent_count;
 static uint32_t last_server_service, last_server_node, last_server_port;
@@ -366,6 +368,48 @@ static void test_flow_control(void)
     CHECK(last_dst_port == 0x05);
 }
 
+/* The flow table is keyed on the destination, and the modem opens a source port for every stream it starts: the
+   seven RMTFS requests of 2026-11-22 came from seven ports, and nine ports were in use over the run. The table
+   has to hold them all: when it was shorter than the modem's port count, the answer to the ninth destination was
+   refused and never reached the modem.
+
+   A destination whose credit is all back holds nothing, so its slot is reusable. */
+static void test_flow_table_capacity(void)
+{
+    static struct qrtr_state q;
+    qrtr_init(&q, 7, link_send, link_server, 0);
+    sent_count = 0;
+    qrtr_send(&q, 3, QRTR_PORT_CTRL, QRTR_TYPE_HELLO, 0, 0);
+
+    /* Every destination the modem may pick gets its own flow, and each packet goes out. */
+    for (uint32_t port = 1; port <= QRTR_MAX_FLOWS; port++)
+        CHECK(qrtr_send_data(&q, 0x4100, 9, port, "hi", 2) == 0);
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < QRTR_MAX_FLOWS; i++)
+        if (q.flow[i].used) used++;
+    CHECK(used == QRTR_MAX_FLOWS);
+
+    /* The table is full, but a destination whose credit is all back holds nothing, so its slot is taken over
+       and the next answer still goes out. */
+    qrtr_resume_tx(&q, 9, 1);
+    CHECK(qrtr_send_data(&q, 0x4100, 9, QRTR_MAX_FLOWS + 1, "hi", 2) == 0);
+    used = 0;
+    for (uint32_t i = 0; i < QRTR_MAX_FLOWS; i++)
+        if (q.flow[i].used) used++;
+    CHECK(used == QRTR_MAX_FLOWS);
+
+    /* A table that is full of destinations which still owe credit is not taken over: the packet is refused,
+       because taking a slot over would forget a credit that is owed. */
+    qrtr_init(&q, 7, link_send, link_server, 0);
+    sent_count = 0;
+    qrtr_send(&q, 3, QRTR_PORT_CTRL, QRTR_TYPE_HELLO, 0, 0);
+    for (uint32_t port = 1; port <= QRTR_MAX_FLOWS; port++)
+        CHECK(qrtr_send_data(&q, 0x4100, 9, port, "hi", 2) == 0);
+    for (uint32_t i = 0; i < QRTR_MAX_FLOWS; i++)
+        CHECK(q.flow[i].pending > 0);
+    CHECK(qrtr_send_data(&q, 0x4100, 9, QRTR_MAX_FLOWS + 1, "hi", 2) == -1);
+}
+
 /* Announcing one of our own services: the NEW_SERVER the peer reads to learn that the service exists and
    where it is. The body carries the command word, the service, the instance word (the version in the low
    byte and the instance in the high one), our own node and the local port the service is served on. */
@@ -409,6 +453,7 @@ int main(void)
     test_peer_hello();
     test_lookup();
     test_flow_control();
+    test_flow_table_capacity();
     if (failures) { printf("%d failures\n", failures); return 1; }
     printf("qrtr model: ok\n");
     return 0;

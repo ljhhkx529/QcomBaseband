@@ -197,10 +197,19 @@ int qrtr_send_lookup_to(struct qrtr_state *q, uint32_t node, uint32_t service, u
 }
 
 /* The flow of one destination: the DATA packets the peer has not credited yet. Upstream keys the flow on the
-   destination's node and port (Linux net/qrtr/af_qrtr.c, qrtr_tx_wait: `key = dest_node << 32 | dest_port`). */
+   destination's node and port (Linux net/qrtr/af_qrtr.c, qrtr_tx_wait: `key = dest_node << 32 | dest_port`).
+
+   The table is small and the destinations are not: on 2026-11-22 the modem sent its seven RMTFS requests from
+   seven different source ports, and it sends the bridge's own requests from others, so the table filled up with
+   one slot per port and the eighth destination's answer was refused with nowhere on the log to say why.
+
+   A slot whose credit is all back is free in every sense that matters: it holds no outstanding packet, and it is
+   made again on demand with the same zero count. So a full table takes one of those over rather than refusing
+   the packet. */
 static struct qrtr_flow *flow_find(struct qrtr_state *q, uint32_t node, uint32_t port, int create)
 {
     struct qrtr_flow *free_slot = 0;
+    struct qrtr_flow *settled_slot = 0;
     for (uint32_t i = 0; i < QRTR_MAX_FLOWS; i++) {
         struct qrtr_flow *f = &q->flow[i];
         if (!f->used) {
@@ -208,8 +217,12 @@ static struct qrtr_flow *flow_find(struct qrtr_state *q, uint32_t node, uint32_t
             continue;
         }
         if (f->node == node && f->port == port) return f;
+        /* A destination whose credit is all back: nothing of its is outstanding. */
+        if (!settled_slot && !f->pending) settled_slot = f;
     }
-    if (!create || !free_slot) return 0;
+    if (!create) return 0;
+    if (!free_slot) free_slot = settled_slot;
+    if (!free_slot) return 0;
     free_slot->used = 1;
     free_slot->node = node;
     free_slot->port = port;
