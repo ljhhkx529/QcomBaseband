@@ -88,6 +88,11 @@ void qrtr_set_data_handler(struct qrtr_state *q, qrtr_data_fn data)
     q->data_fn = data;
 }
 
+void qrtr_set_lookup_handler(struct qrtr_state *q, qrtr_lookup_fn lookup)
+{
+    q->lookup_fn = lookup;
+}
+
 void qrtr_set_trace(struct qrtr_state *q, void (*trace)(void *context, const uint8_t *bytes, uint32_t length),
                     void *context)
 {
@@ -453,6 +458,21 @@ void qrtr_receive(struct qrtr_state *q, const void *data, uint32_t length)
            to; the source node and port say who sent it. */
         if (q->data_fn) q->data_fn(q->context, dst_port, src_node, src_port, body, size);
         else q->dropped++;
+        return;
+    }
+    if (type == QRTR_TYPE_NEW_LOOKUP) {
+        /* The peer asks which of our services it may have. The body carries the service and the instance
+           word it wants, and a service of 0 and an instance of 0 ask for everything.
+           Upstream's name service answers a lookup the same way (Linux net/qrtr/ns.c, ctrl_cmd_new_lookup
+           and lookup_notify): a NEW_SERVER for every service that matches, and then the empty NEW_SERVER
+           that ends the listing. */
+        if (size < QRTR_CTRL_LEN) {
+            q->malformed++;
+            return;
+        }
+        const uint32_t service = rd32(body + 4);
+        const uint32_t instance = rd32(body + 8);
+        if (q->lookup_fn) q->lookup_fn(q->context, service, instance, src_node);
         return;
     }
     /* BYE, DEL_CLIENT, PING and the lookups need no answer here. */

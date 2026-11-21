@@ -22,6 +22,7 @@
 #include "qcom_qrtr.h"
 
 #include "fuxi_servreg.h"
+#include "fuxi_rmtfs.h"
 
 #include "QcomGlink.h"
 #include "QcomSmem.h"
@@ -68,6 +69,10 @@ typedef struct {
     /* Rings the remote when the link has something to say. */
     void (*kick)(void *context);
     void *kick_context;
+    /* RMTFS: the board's adapter for the modem's remote file system. The protocol half is here, the
+       partition reads and the buffer are the board's, and the two are joined by these callbacks. */
+    struct fuxi_rmtfs_ops rmtfs_ops;
+    void *rmtfs_context;
 } fuxi_modem_link_config;
 
 /* What the link has seen, for the board's own report. The board's probe owns the bring-up and reads these
@@ -114,6 +119,9 @@ typedef struct {
     /* The service registry's locator: how often it was announced, how many requests it took and how many of
        them were answered. A request count that stays at zero says the modem never asked. */
     uint32_t locator_announces, locator_requests, locator_answered;
+    /* RMTFS: the modem's remote file system. The counts say whether the modem asked for its files at all:
+       the announcements, the requests that arrived, and the ones that were answered. */
+    uint32_t rmtfs_announces, rmtfs_requests, rmtfs_answered;
     char last_unknown[QCOM_GLINK_NAME];
 } fuxi_modem_link_status;
 
@@ -154,6 +162,15 @@ typedef struct {
     /* The number of the peer's HELLOs the last announcement answered. The announcement is sent again when the
        peer's count has moved past it, so a HELLO is always answered with one. */
     uint32_t locator_hello_at;
+    /* RMTFS: the modem's remote file system. It is announced and served the same way as the locator, on its own
+       local port. The counts say what the modem asked of it. */
+    struct fuxi_rmtfs_state rmtfs;
+    uint8_t rmtfs_announced;
+    uint32_t rmtfs_announces, rmtfs_requests, rmtfs_answered;
+    uint32_t rmtfs_hello_at;
+    /* The board's adapter: the partition reads and the buffer. */
+    struct fuxi_rmtfs_ops rmtfs_ops;
+    void *rmtfs_context;
 
 } fuxi_modem_link;
 
@@ -198,6 +215,40 @@ static void fuxi_qrtr_new_server(void *context, uint32_t service, uint32_t insta
     coachz_baseband_new_server(service, instance, node, port);
 }
 
+/* The peer asked which of our services it may have. The answer is a NEW_SERVER for every service of ours that
+   matches, and then the empty NEW_SERVER that ends the listing (Linux net/qrtr/ns.c, ctrl_cmd_new_lookup and
+   lookup_notify: "Empty notification, to indicate end of listing").
+ *
+   The match is upstream's: a lookup whose service is zero matches any service, and a lookup whose instance is
+   zero matches any instance (Linux net/qrtr/ns.c, server_match). */
+static void fuxi_qrtr_lookup(void *context, uint32_t service, uint32_t version_instance, uint32_t node)
+{
+    fuxi_modem_link *link = context;
+    static const struct {
+        uint32_t service, version, instance, port;
+    } ours[] = {
+        {FUXI_LOCATOR_SERVICE, FUXI_LOCATOR_VERSION, FUXI_LOCATOR_INSTANCE, FUXI_LOCATOR_PORT},
+        {FUXI_RMTFS_SERVICE, FUXI_RMTFS_VERSION, FUXI_RMTFS_INSTANCE, FUXI_RMTFS_PORT},
+    };
+    /* The instance word: the version in the low byte, the instance in the high one. */
+    const uint32_t wanted_instance = version_instance >> 8;
+    const uint32_t wanted_version = version_instance & 0xffu;
+    for (unsigned i = 0; i < sizeof ours / sizeof ours[0]; ++i) {
+        if (service && service != ours[i].service) continue;
+        if (wanted_instance && wanted_instance != ours[i].instance) continue;
+        if (wanted_version && wanted_version != ours[i].version) continue;
+        qrtr_send_new_server(&link->qrtr, node, ours[i].service, ours[i].version, ours[i].instance, ours[i].port);
+        printf("FUXI_MODEM: the lookup was answered: service 0x%02x version %u instance %u, on port %u, to node %u\n",
+               ours[i].service, ours[i].version, ours[i].instance, ours[i].port, node);
+    }
+    /* The empty NEW_SERVER ends the listing: it carries neither a service nor a port. */
+    qrtr_send_new_server(&link->qrtr, node, 0, 0, 0, 0);
+}
+
+/* The modem's remote file system: answers what the modem asks it. Defined below. */
+static void fuxi_rmtfs_receive(fuxi_modem_link *link, uint32_t src_node, uint32_t src_port, const void *body,
+                               uint32_t length);
+
 /* The QRTR layer's data hook: one payload for the bridge. The destination port is the bridge's local client port. */
 static void fuxi_qrtr_data(void *context, uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body,
                            uint32_t length)
@@ -208,6 +259,12 @@ static void fuxi_qrtr_data(void *context, uint32_t dst_port, uint32_t src_node, 
        the modem asks where its own services are, and it is answered straight out of the modem's own table. */
     if (dst_port == FUXI_LOCATOR_PORT) {
         fuxi_servreg_receive(link, src_node, src_port, body, length);
+        return;
+    }
+    /* RMTFS is served on its own port too, and not by the bridge: it is the host service the modem asks
+       for its own files, and the bridge's client ports do not carry it. */
+    if (dst_port == FUXI_RMTFS_PORT) {
+        fuxi_rmtfs_receive(link, src_node, src_port, body, length);
         return;
     }
     extern int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body, uint32_t size);
@@ -276,6 +333,70 @@ static int fuxi_announce_locator(fuxi_modem_link *link, uint32_t node)
     link->locator_hello_at = link->qrtr.hellos;
     printf("FUXI_MODEM: the locator was announced: service 0x%02x version %u instance %u, on port %u, to node %u\n",
            FUXI_LOCATOR_SERVICE, FUXI_LOCATOR_VERSION, FUXI_LOCATOR_INSTANCE, FUXI_LOCATOR_PORT, node);
+    return 0;
+}
+
+/* The modem's remote file system: answers what the modem asks it.
+ *
+ * The answer goes back to the node and port the request came from, from RMTFS's own port, because the
+ * modem routes the answer back by the port the request named. Every request's message id goes to the
+ * log on one line, and the raw bytes of the first OPEN go to the log with it, so the wire can be read
+ * off the capture: what the modem asked for, and what was told. */
+static void fuxi_rmtfs_receive(fuxi_modem_link *link, uint32_t src_node, uint32_t src_port, const void *body,
+                                uint32_t length)
+{
+    uint8_t answer[256];
+    uint32_t answer_length = 0;
+    uint32_t message = 0;
+    link->rmtfs_requests++;
+    const int served = fuxi_rmtfs_serve(&link->rmtfs, (const uint8_t *)body, length, answer, sizeof answer,
+                                        &answer_length, &link->rmtfs_ops, link->rmtfs_context, &message);
+    if (!served) {
+        printf("FUXI_MODEM: the rmtfs was sent %u bytes it cannot answer\n", length);
+        return;
+    }
+    /* The message id and its name on one line. The names are the reference's
+       (hakios.mpss.c, RMTFS_OPEN and the four after it). */
+    const char *name = "unknown";
+    switch (message) {
+    case FUXI_RMTFS_OPEN: name = "OPEN"; break;
+    case FUXI_RMTFS_CLOSE: name = "CLOSE"; break;
+    case FUXI_RMTFS_RW_IOVEC: name = "RW_IOVEC"; break;
+    case FUXI_RMTFS_ALLOC_BUFF: name = "ALLOC_BUFF"; break;
+    case FUXI_RMTFS_GET_DEV_ERROR: name = "GET_DEV_ERROR"; break;
+    }
+    printf("FUXI_MODEM: the rmtfs: the modem asks %s (message %u), %u bytes\n", name, message, length);
+    /* The first OPEN's raw bytes: the path the modem asks for is in them, and the path is the whole
+       question this round is about. */
+    if (message == FUXI_RMTFS_OPEN && link->rmtfs_requests == 1u) {
+        printf("FUXI_MODEM: the rmtfs: the first OPEN is %u bytes:", length);
+        for (uint32_t i = 0; i < length && i < 96u; ++i) printf(" %02x", ((const uint8_t *)body)[i]);
+        printf("\n");
+    }
+    if (qrtr_send_data(&link->qrtr, FUXI_RMTFS_PORT, src_node, src_port, answer, answer_length)) {
+        snprintf(link->last_error, sizeof link->last_error, "the rmtfs's answer was refused");
+        return;
+    }
+    link->rmtfs_answered++;
+}
+
+/* Announces RMTFS to the peer: a NEW_SERVER naming the service, the version and instance it is published
+   under, and the local port it is served on. The instance word is 1: version 1, instance 0.
+ *
+   Returns 0 when the announcement went out. */
+static int fuxi_announce_rmtfs(fuxi_modem_link *link, uint32_t node)
+{
+    if (qrtr_send_new_server(&link->qrtr, node, FUXI_RMTFS_SERVICE, FUXI_RMTFS_VERSION, FUXI_RMTFS_INSTANCE,
+                             FUXI_RMTFS_PORT)) {
+        snprintf(link->last_error, sizeof link->last_error, "the rmtfs's announcement was refused");
+        return -1;
+    }
+    link->rmtfs_announces++;
+    /* The peer's HELLO count this announcement answers. The next HELLO moves the count past it, and that is
+       what makes the announcement go out again. */
+    link->rmtfs_hello_at = link->qrtr.hellos;
+    printf("FUXI_MODEM: the rmtfs was announced: service 0x%02x version %u instance %u, on port %u, to node %u\n",
+           FUXI_RMTFS_SERVICE, FUXI_RMTFS_VERSION, FUXI_RMTFS_INSTANCE, FUXI_RMTFS_PORT, node);
     return 0;
 }
 
@@ -391,6 +512,9 @@ int fuxi_modem_start(const fuxi_modem_link_config *config)
     link->config = *config;
     link->smem.base = config->smem_base;
     link->smem.size = config->smem_size;
+    /* The board's adapter for RMTFS: the partition reads and the buffer. */
+    link->rmtfs_ops = config->rmtfs_ops;
+    link->rmtfs_context = config->rmtfs_context;
     if (qcom_smem_partition(&link->smem, QCOM_SMEM_HOST_APPS, FUXI_MODEM_PID, &link->partition)) {
         snprintf(link->last_error, sizeof link->last_error, "no SMEM partition with the modem (pid %u)", FUXI_MODEM_PID);
         return -1;
@@ -399,6 +523,7 @@ int fuxi_modem_start(const fuxi_modem_link_config *config)
 
     qrtr_init(&link->qrtr, FUXI_QRTR_LOCAL_NODE, fuxi_qrtr_send, fuxi_qrtr_new_server, link);
     qrtr_set_data_handler(&link->qrtr, fuxi_qrtr_data);
+    qrtr_set_lookup_handler(&link->qrtr, fuxi_qrtr_lookup);
     qrtr_set_trace(&link->qrtr, fuxi_trace_qrtr, 0);
     qrtr_set_trace_tx(&link->qrtr, fuxi_trace_qrtr_tx, 0);
     /* The HELLO is owed, not sent: the GLINK channel is only up once the modem opens it, and a HELLO sent before
@@ -433,6 +558,16 @@ void fuxi_modem_poll(void)
             if (fuxi_announce_locator(link, link->qrtr.remote_node) == 0) link->locator_announced = 1;
         } else if (link->qrtr.hellos > link->locator_hello_at) {
             fuxi_announce_locator(link, link->qrtr.remote_node);
+        }
+    }
+    /* RMTFS is announced the same way, and for the same reason: the modem learns of it only from the
+       announcement, and an announcement that is not repeated on the peer's next HELLO leaves the peer
+       without it. */
+    if (link->ready && link->qrtr.remote_node_known) {
+        if (!link->rmtfs_announced) {
+            if (fuxi_announce_rmtfs(link, link->qrtr.remote_node) == 0) link->rmtfs_announced = 1;
+        } else if (link->qrtr.hellos > link->rmtfs_hello_at) {
+            fuxi_announce_rmtfs(link, link->qrtr.remote_node);
         }
     }
     /* The bridge is published once the channel is up. It has to be published after, not before: the bridge's clients
@@ -631,6 +766,9 @@ void fuxi_modem_status(fuxi_modem_link_status *status)
     status->locator_announces = link->locator_announces;
     status->locator_requests = link->locator_requests;
     status->locator_answered = link->locator_answered;
+    status->rmtfs_announces = link->rmtfs_announces;
+    status->rmtfs_requests = link->rmtfs_requests;
+    status->rmtfs_answered = link->rmtfs_answered;
     if (link->channel) {
         for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k) {
             if (!link->channel->remote[k].valid) continue;
@@ -656,6 +794,9 @@ void fuxi_modem_report(unsigned second)
     /* The locator's own counts: how often it was announced, and what the modem asked of it. */
     printf("FUXI modem: %u s: the locator was announced %u times, took %u requests and answered %u\n", second,
            link->locator_announces, link->locator_requests, link->locator_answered);
+    /* RMTFS's own counts: a request count that stays at zero says the modem never asked for its files. */
+    printf("FUXI modem: %u s: the rmtfs was announced %u times, took %u requests and answered %u\n", second,
+           link->rmtfs_announces, link->rmtfs_requests, link->rmtfs_answered);
     if (link->last_error[0]) printf("FUXI modem: last error: %s\n", link->last_error);
 }
 

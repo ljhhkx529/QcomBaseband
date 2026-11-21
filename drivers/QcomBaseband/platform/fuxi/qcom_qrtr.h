@@ -98,6 +98,10 @@ typedef void (*qrtr_server_fn)(void *context, uint32_t service, uint32_t version
    the source node and port say who sent it. Implemented by the board adapter. */
 typedef void (*qrtr_data_fn)(void *context, uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body,
                              uint32_t length);
+/* The peer asks which of our services it may have. The hook announces the ones that match and ends the
+   listing with the empty NEW_SERVER. Upstream's name service answers a lookup the same way
+   (Linux net/qrtr/ns.c, ctrl_cmd_new_lookup and lookup_notify). */
+typedef void (*qrtr_lookup_fn)(void *context, uint32_t service, uint32_t version_instance, uint32_t node);
 
 /* The transport's state. The board fills in the link hooks; the protocol layer keeps the rest. */
 struct qrtr_state {
@@ -127,6 +131,7 @@ struct qrtr_state {
     qrtr_send_fn send;
     qrtr_server_fn server_fn;
     qrtr_data_fn data_fn;
+    qrtr_lookup_fn lookup_fn;
     void *context;
     /* An optional hook that sees the control packets as they arrive, so the wire can be read off the log. */
     void (*trace)(void *context, const uint8_t *bytes, uint32_t length);
@@ -173,6 +178,8 @@ void qrtr_init(struct qrtr_state *q, uint32_t local_node, qrtr_send_fn send, qrt
                void *context);
 /* Sets the handler for DATA packets. */
 void qrtr_set_data_handler(struct qrtr_state *q, qrtr_data_fn data);
+/* Sets the handler for the peer's lookup: it announces the services of ours that match. */
+void qrtr_set_lookup_handler(struct qrtr_state *q, qrtr_lookup_fn lookup);
 /* Sets the hook that sees the first packets as they arrive. */
 void qrtr_set_trace(struct qrtr_state *q, void (*trace)(void *context, const uint8_t *bytes, uint32_t length),
                     void *context);
