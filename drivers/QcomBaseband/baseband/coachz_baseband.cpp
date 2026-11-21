@@ -26,6 +26,7 @@
 #include "coachz_bb_pdp.h"
 #include "coachz_bb_esim.h"
 #include "coachz_bb_ssctl.h"
+#include "coachz_bb_uim_probe.h"
 
 #define BB_FRAME_MAX (64u * 1024u)       // one read or write: a QMUX frame, a SAHARA packet or a READ_DATA answer
 // Frames waiting for ABM, per channel. At boot the 53 clients' registrations and indications arrive faster than ABM reads; with 64 the
@@ -90,6 +91,11 @@ static uint8_t *bb_esim_in, *bb_esim_resp;
 // answer this modem, so the list has to be asked of the modem itself.
 static struct cbq_ssctl bb_ssctl;
 static int bb_ssctl_slot = -1;
+
+// The state of the SIM in the card slot, asked for over UIM (coachz_bb_uim_probe.h). The eSIM control only
+// speaks when a client asks it to, and a physical card is not that: reading card slot one is one request.
+static struct cbp_uim bb_uim;
+static int bb_uim_slot = -1;
 
 static uint32_t bb_now_ms(void)
 {
@@ -407,6 +413,44 @@ static void bb_ssctl_step(void)
   /* The request is asked once. A queue that was full is asked again on the next poll, and a request that did
      go out is not asked again: the failure reason does not change while the modem runs. */
   if (bb_tx_count != queued) bb_ssctl.sent = 1;
+}
+
+// One request to the modem's UIM service: the status of the card slots (coachz_bb_uim_probe.h).
+//
+// The request asks for the state of the card and nothing else. It does not switch the slot, it does not
+// authenticate and it writes nothing to the card, so it is safe to send once when the modem has published UIM.
+//
+// The request is asked once. A queue that was full is asked again on the next poll, and a request that did go
+// out is not asked again: the card's state does not change while the modem runs.
+static void bb_uim_step(void)
+{
+  const struct cbq_server *server = cbq_server_find(&bb_qmux, CBP_SVC_UIM);
+  if (!server) return;
+  if (bb_uim_slot < 0) bb_uim_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, CBP_SVC_UIM);
+  if (bb_uim_slot < 0) return;
+  if (bb_uim.sent || bb_uim.answered) return;
+  uint8_t sdu[32];
+  const uint32_t n = cbp_build_request(sdu, sizeof sdu, 0x23u, CBP_UIM_GET_SLOT_STATUS);
+  if (!n) return;
+  const uint32_t queued = bb_tx_count;
+  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_uim_slot, server->node, server->port, sdu, n);
+  if (bb_tx_count != queued) bb_uim.sent = 1;
+}
+
+// The modem's answer about the card, on the record.
+static void bb_uim_log(const uint8_t *sdu, uint32_t size)
+{
+  printf("COACHZ baseband: the UIM answer: error %u, %u TLVs\n", bb_uim.error, bb_uim.tlv_count);
+  /* The answer's own bytes. The TLV layout of the slot status is not in this tree, so the bytes are what
+     settles it: an answer that names a card and one that does not look different in a way that can be read off
+     the log. */
+  printf("COACHZ baseband: the answer is %u bytes:", size);
+  for (uint32_t i = 0; i < size && i < 96; ++i) printf(" %02x", sdu[i]);
+  printf("\n");
+  printf("COACHZ baseband: the answer carries %u TLVs:", bb_uim.tlv_count);
+  for (uint32_t i = 0; i < bb_uim.tlv_count; ++i)
+    printf(" type 0x%02x of %u bytes", bb_uim.tlv_types[i], bb_uim.tlv_lens[i]);
+  printf("\n");
 }
 
 // eSIM control runs on the same QRTR owner as the other QMI traffic (bb_lock held).
@@ -1256,6 +1300,15 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
       bb_ssctl.tlv_count = 0;
       const int read = cbs_read_answer(&bb_ssctl, sdu, size);
       if (read) bb_ssctl_log(sdu, size);
+    } else if (bb_uim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_uim_slot &&
+               r.service == CBP_SVC_UIM) {
+      // The modem's answer to the slot status request.
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      /* The TLVs of this answer only: the counter is cleared before the answer is read, so the types the log
+         shows are the ones this answer carried. */
+      bb_uim.tlv_count = 0;
+      const int read = cbp_read_answer(&bb_uim, sdu, size);
+      if (read) { bb_uim.answered = 1; bb_uim_log(sdu, size); }
     } else if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
       cbe_answer(&bb_esim, static_cast<const uint8_t *>(body), size, bb_now_ms());
     } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
@@ -1289,6 +1342,7 @@ extern "C" void coachz_baseband_poll(void)
   uint32_t n = 0, released[16], r = 0, port;
   IOLockLock(bb_lock);
   bb_ssctl_step();
+  bb_uim_step();
   bb_esim_step();
   while (bb_tx_count && n < 16) {
     batch[n++] = bb_txq[bb_tx_head];
@@ -1359,6 +1413,11 @@ extern "C" void coachz_baseband_report(unsigned second)
            bb_ssctl.error, bb_ssctl.reason_len);
   else if (bb_ssctl.sent)
     printf("COACHZ baseband: %u s: the modem's failure reason was asked for, no answer yet\n", second);
+  /* The state of the card. */
+  if (bb_uim.answered)
+    printf("COACHZ baseband: %u s: the card's slot status: error %u, %u TLVs\n", second, bb_uim.error, bb_uim.tlv_count);
+  else if (bb_uim.sent)
+    printf("COACHZ baseband: %u s: the card's slot status was asked for, no answer yet\n", second);
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) {
     const bb_channel *ch = &bb_ch[c];
     if (ch->opens)
