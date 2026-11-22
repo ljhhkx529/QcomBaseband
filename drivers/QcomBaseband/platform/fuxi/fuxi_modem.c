@@ -23,6 +23,7 @@
 
 #include "fuxi_servreg.h"
 #include "fuxi_rmtfs.h"
+#include "fuxi_tftp.h"
 
 #include "QcomGlink.h"
 #include "QcomSmem.h"
@@ -73,6 +74,10 @@ typedef struct {
        partition reads and the buffer are the board's, and the two are joined by these callbacks. */
     struct fuxi_rmtfs_ops rmtfs_ops;
     void *rmtfs_context;
+    /* TFTP: the board's adapter for the modem's carrier configuration. The protocol half is here, the
+       files and the reads are the board's, and the two are joined by these callbacks. */
+    struct fuxi_tftp_ops tftp_ops;
+    void *tftp_context;
 } fuxi_modem_link_config;
 
 /* What the link has seen, for the board's own report. The board's probe owns the bring-up and reads these
@@ -125,6 +130,11 @@ typedef struct {
     /* RMTFS: the modem's remote file system. The counts say whether the modem asked for its files at all:
        the announcements, the requests that arrived, and the ones that were answered. */
     uint32_t rmtfs_announces, rmtfs_requests, rmtfs_answered;
+    /* TFTP: the modem's carrier configuration. The counts say whether the modem asked for it at all: the
+       announcements, the requests that arrived, the ones that were answered, and the reads and the writes.
+       A request count that stays at zero says the modem never asked, which is the fact that decides
+       whether the announcement reached it. */
+    uint32_t tftp_announces, tftp_requests, tftp_answered, tftp_reads, tftp_writes, tftp_missing;
     char last_unknown[QCOM_GLINK_NAME];
 } fuxi_modem_link_status;
 
@@ -171,6 +181,14 @@ typedef struct {
     uint8_t rmtfs_announced;
     uint32_t rmtfs_announces, rmtfs_requests, rmtfs_answered;
     uint32_t rmtfs_hello_at;
+    /* TFTP: the modem's carrier configuration. It is announced and served the same way as the locator and
+       the remote file system, on its own local ports. The counts say what the modem asked of it. */
+    struct fuxi_tftp_state tftp;
+    uint8_t tftp_announced;
+    uint32_t tftp_announces, tftp_hello_at;
+    /* The board's adapter: it opens the modem's files and reads them out. */
+    struct fuxi_tftp_ops tftp_ops;
+    void *tftp_context;
     /* The board's adapter: the partition reads and the buffer. */
     struct fuxi_rmtfs_ops rmtfs_ops;
     void *rmtfs_context;
@@ -232,6 +250,10 @@ static void fuxi_qrtr_lookup(void *context, uint32_t service, uint32_t version_i
     } ours[] = {
         {FUXI_LOCATOR_SERVICE, FUXI_LOCATOR_VERSION, FUXI_LOCATOR_INSTANCE, FUXI_LOCATOR_PORT},
         {FUXI_RMTFS_SERVICE, FUXI_RMTFS_VERSION, FUXI_RMTFS_INSTANCE, FUXI_RMTFS_PORT},
+        /* TFTP at both versions the modem may look it up under: the modem asks for the version its own
+           firmware expects, and the reference publishes both. */
+        {FUXI_TFTP_SERVICE, FUXI_TFTP_VERSION, FUXI_TFTP_INSTANCE, FUXI_TFTP_PORT},
+        {FUXI_TFTP_SERVICE, FUXI_TFTP_VERSION_ALT, FUXI_TFTP_INSTANCE, FUXI_TFTP_PORT_ALT},
     };
     /* The instance word: the version in the low byte, the instance in the high one. */
     const uint32_t wanted_instance = version_instance >> 8;
@@ -252,6 +274,10 @@ static void fuxi_qrtr_lookup(void *context, uint32_t service, uint32_t version_i
 static void fuxi_rmtfs_receive(fuxi_modem_link *link, uint32_t src_node, uint32_t src_port, const void *body,
                                uint32_t length);
 
+/* The modem's carrier configuration over TFTP: answers what the modem asks it. Defined below. */
+static void fuxi_tftp_receive(fuxi_modem_link *link, uint32_t dst_port, uint32_t src_node, uint32_t src_port,
+                              const void *body, uint32_t length);
+
 /* The QRTR layer's data hook: one payload for the bridge. The destination port is the bridge's local client port. */
 static void fuxi_qrtr_data(void *context, uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body,
                            uint32_t length)
@@ -268,6 +294,13 @@ static void fuxi_qrtr_data(void *context, uint32_t dst_port, uint32_t src_node, 
        for its own files, and the bridge's client ports do not carry it. */
     if (dst_port == FUXI_RMTFS_PORT) {
         fuxi_rmtfs_receive(link, src_node, src_port, body, length);
+        return;
+    }
+    /* TFTP is served on its own ports, and on the transfer ports a transfer of its own runs over. */
+    if (dst_port == FUXI_TFTP_PORT || dst_port == FUXI_TFTP_PORT_ALT ||
+        (dst_port >= FUXI_TFTP_TRANSFER_PORT_BASE &&
+         dst_port < FUXI_TFTP_TRANSFER_PORT_BASE + FUXI_TFTP_TRANSFER_SLOTS)) {
+        fuxi_tftp_receive(link, dst_port, src_node, src_port, body, length);
         return;
     }
     extern int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body, uint32_t size);
@@ -403,6 +436,80 @@ static int fuxi_announce_rmtfs(fuxi_modem_link *link, uint32_t node)
     return 0;
 }
 
+/* Announces TFTP to the peer: the modem's carrier configuration, at the two versions the modem may look
+   it up under.
+ *
+   The service is published at version 1 and at version 3, because the modem looks up the version its own
+   firmware expects and the reference publishes both (umi_modem_mhi.inc:690-691 and md_tftp_announce: the
+   SDX55 looks up v3). A modem that looks up either one finds the service.
+ *
+   Returns 0 when both announcements went out. */
+static int fuxi_announce_tftp(fuxi_modem_link *link, uint32_t node)
+{
+    if (qrtr_send_new_server(&link->qrtr, node, FUXI_TFTP_SERVICE, FUXI_TFTP_VERSION, FUXI_TFTP_INSTANCE,
+                             FUXI_TFTP_PORT)) {
+        snprintf(link->last_error, sizeof link->last_error, "the tftp's announcement was refused");
+        return -1;
+    }
+    if (qrtr_send_new_server(&link->qrtr, node, FUXI_TFTP_SERVICE, FUXI_TFTP_VERSION_ALT, FUXI_TFTP_INSTANCE,
+                             FUXI_TFTP_PORT_ALT)) {
+        snprintf(link->last_error, sizeof link->last_error, "the tftp's second announcement was refused");
+        return -1;
+    }
+    link->tftp_announces++;
+    /* The peer's HELLO count this announcement answers. The next HELLO moves the count past it, and that is
+       what makes the announcement go out again. */
+    link->tftp_hello_at = link->qrtr.hellos;
+    printf("FUXI_MODEM: the tftp was announced: service 0x%04x version %u and %u instance %u, on port %u and %u, to node %u\n",
+           FUXI_TFTP_SERVICE, FUXI_TFTP_VERSION, FUXI_TFTP_VERSION_ALT, FUXI_TFTP_INSTANCE, FUXI_TFTP_PORT,
+           FUXI_TFTP_PORT_ALT, node);
+    return 0;
+}
+
+/* The board's adapter sends one TFTP packet out. */
+static int fuxi_tftp_send(void *context, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const uint8_t *body,
+                          uint32_t length)
+{
+    fuxi_modem_link *link = context;
+    return qrtr_send_data(&link->qrtr, src_port, dst_node, dst_port, body, length);
+}
+
+/* The modem's carrier configuration over TFTP: answers what the modem asks it.
+ *
+ * The request's own bytes go to the log, and so do the answer's, because the wire is the whole question
+ * this service is about: the modem's carrier configuration is the file it is looking for, and the path in
+ * the request is what names it.
+ *
+ * The opcode is on the log with its number, and so is the shape it arrived in: the two references disagree
+ * about where the opcode sits, and the device is what settles it. */
+static void fuxi_tftp_receive(fuxi_modem_link *link, uint32_t dst_port, uint32_t src_node, uint32_t src_port,
+                              const void *body, uint32_t length)
+{
+    uint32_t opcode = 0;
+    uint32_t wide = 0;
+    const int served = fuxi_tftp_serve(&link->tftp, dst_port, src_node, src_port, (const uint8_t *)body, length,
+                                        &link->tftp_ops, link, &opcode, &wide);
+    if (!served) {
+        printf("FUXI_MODEM: the tftp was sent %u bytes it cannot answer\n", length);
+        return;
+    }
+    const char *name = "unknown";
+    switch (opcode) {
+    case FUXI_TFTP_RRQ: name = "RRQ"; break;
+    case FUXI_TFTP_WRQ: name = "WRQ"; break;
+    case FUXI_TFTP_DATA: name = "DATA"; break;
+    case FUXI_TFTP_ACK: name = "ACK"; break;
+    case FUXI_TFTP_ERROR: name = "ERROR"; break;
+    case FUXI_TFTP_OACK: name = "OACK"; break;
+    }
+    printf("FUXI_MODEM: the tftp: the modem asks %s (opcode %u%s), %u bytes, on port %u\n", name, opcode,
+           wide ? ", the wide shape" : "", length, dst_port);
+    /* The request's own bytes, so the path it names is on the log. */
+    printf("FUXI_MODEM: the tftp: the request is %u bytes:", length);
+    for (uint32_t i = 0; i < length && i < 96u; ++i) printf(" %02x", ((const uint8_t *)body)[i]);
+    printf("\n");
+}
+
 /* Dumps one received QRTR packet, header and body, so the wire can be read off the log.
  *
  * The whole packet is printed, not the first 64 bytes: an RMTFS request carries its entries at the
@@ -521,6 +628,11 @@ int fuxi_modem_start(const fuxi_modem_link_config *config)
     /* The board's adapter for RMTFS: the partition reads and the buffer. */
     link->rmtfs_ops = config->rmtfs_ops;
     link->rmtfs_context = config->rmtfs_context;
+    /* The board's adapter for TFTP: the modem's own files, read only. */
+    link->tftp_ops = config->tftp_ops;
+    link->tftp_context = config->tftp_context;
+    /* The send hook is the link's own: the protocol half needs to put its answers on the wire. */
+    if (!link->tftp_ops.send) link->tftp_ops.send = fuxi_tftp_send;
     if (qcom_smem_partition(&link->smem, QCOM_SMEM_HOST_APPS, FUXI_MODEM_PID, &link->partition)) {
         snprintf(link->last_error, sizeof link->last_error, "no SMEM partition with the modem (pid %u)", FUXI_MODEM_PID);
         return -1;
@@ -574,6 +686,17 @@ void fuxi_modem_poll(void)
             if (fuxi_announce_rmtfs(link, link->qrtr.remote_node) == 0) link->rmtfs_announced = 1;
         } else if (link->qrtr.hellos > link->rmtfs_hello_at) {
             fuxi_announce_rmtfs(link, link->qrtr.remote_node);
+        }
+    }
+    /* TFTP is announced the same way as the other two, and for the same reason: the modem learns of the
+       service only from the announcement, and an announcement that is not repeated on the peer's next HELLO
+       leaves the peer without it. The modem looks up the version its own firmware expects, so both versions
+       are published. */
+    if (link->ready && link->qrtr.remote_node_known) {
+        if (!link->tftp_announced) {
+            if (fuxi_announce_tftp(link, link->qrtr.remote_node) == 0) link->tftp_announced = 1;
+        } else if (link->qrtr.hellos > link->tftp_hello_at) {
+            fuxi_announce_tftp(link, link->qrtr.remote_node);
         }
     }
     /* The bridge is published once the channel is up. It has to be published after, not before: the bridge's clients
@@ -785,6 +908,13 @@ void fuxi_modem_status(fuxi_modem_link_status *status)
     status->rmtfs_announces = link->rmtfs_announces;
     status->rmtfs_requests = link->rmtfs_requests;
     status->rmtfs_answered = link->rmtfs_answered;
+    /* TFTP's own counts: the carrier configuration the modem asked for, and how much of it went out. */
+    status->tftp_announces = link->tftp_announces;
+    status->tftp_requests = link->tftp.requests;
+    status->tftp_answered = link->tftp.answered;
+    status->tftp_reads = link->tftp.reads;
+    status->tftp_writes = link->tftp.writes;
+    status->tftp_missing = link->tftp.missing;
     if (link->channel) {
         for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k) {
             if (!link->channel->remote[k].valid) continue;
@@ -813,6 +943,12 @@ void fuxi_modem_report(unsigned second)
     /* RMTFS's own counts: a request count that stays at zero says the modem never asked for its files. */
     printf("FUXI modem: %u s: the rmtfs was announced %u times, took %u requests and answered %u\n", second,
            link->rmtfs_announces, link->rmtfs_requests, link->rmtfs_answered);
+    /* TFTP's own counts: a request count that stays at zero says the modem never asked for its carrier
+       configuration, which is the gate this service is behind. */
+    printf("FUXI modem: %u s: the tftp was announced %u times, took %u requests and answered %u, read %u blocks, "
+           "wrote %u, missed %u\n",
+           second, link->tftp_announces, link->tftp.requests, link->tftp.answered, link->tftp.reads,
+           link->tftp.writes, link->tftp.missing);
     if (link->last_error[0]) printf("FUXI modem: last error: %s\n", link->last_error);
 }
 
