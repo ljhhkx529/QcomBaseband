@@ -2,11 +2,13 @@
    Built with -fsanitize=address,undefined by scripts/check.py.
 
    The protocol is TFTP's over a QRTR data packet:
-     byte 0     always zero
-     byte 1     the opcode (RRQ 1, WRQ 2, DATA 3, ACK 4, ERROR 5, OACK 6)
-     bytes 2-3  the block number, big-endian
+     bytes 0-1  the opcode, big-endian (RRQ 1, WRQ 2, DATA 3, ACK 4, ERROR 5, OACK 6)
      then       the path, NUL-terminated, the mode string, NUL-terminated, and the options as pairs of
                 NUL-terminated name and value
+
+   A request carries no block number: the path starts at byte 2. The modem's own requests begin
+   "00 01 2f 72 65 61 64", which is the opcode and then "/read" (measured on 2026-11-22, and
+   hakios.mpss.c:4311-4312 reads the name from byte 2 as well).
 
    What is worth a test here is the reader and the writer. A request read from the wrong place would be
    answered for the wrong file, and an answer built with the wrong shape would be a transfer that never
@@ -77,7 +79,27 @@ static int mock_send(void *context, uint32_t src_port, uint32_t dst_node, uint32
     return 0;
 }
 
-static const struct fuxi_tftp_ops ops = {mock_open, mock_read, mock_size, mock_close, mock_send};
+/* What the modem wrote is kept here, the way the board's adapter keeps it: in memory, under the name the
+   modem used. The test reads it back to prove the round trip works. */
+static char stored_name[256];
+static uint8_t stored_bytes[4096];
+static uint32_t stored_length;
+static uint32_t stored_calls;
+
+static int mock_store(void *context, const char *name, uint32_t name_length, const void *data, uint32_t length)
+{
+    (void)context;
+    if (name_length >= sizeof stored_name) return -1;
+    memcpy(stored_name, name, name_length);
+    stored_name[name_length] = 0;
+    if (stored_length + length > sizeof stored_bytes) return -1;
+    memcpy(stored_bytes + stored_length, data, length);
+    stored_length += length;
+    stored_calls++;
+    return 0;
+}
+
+static const struct fuxi_tftp_ops ops = {mock_open, mock_read, mock_size, mock_close, mock_send, mock_store};
 
 /* Builds a TFTP request: the header, the path, the mode, and the options.
    The options are given as pairs of names and values, and a null name ends them. */
@@ -88,8 +110,6 @@ static uint32_t build_request(uint8_t *out, uint32_t cap, uint8_t opcode, const 
     if (cap < 8u) return 0;
     out[at++] = 0;
     out[at++] = opcode;
-    out[at++] = 0;
-    out[at++] = 0;
     const size_t path_length = strlen(path);
     if (at + path_length + 1u > cap) return 0;
     memcpy(out + at, path, path_length);
@@ -178,6 +198,18 @@ int main(void)
         CHECK(r.wide == 1);
     }
 
+    /* The path starts at byte 2, and nothing is eaten off the front of it. The modem's own request bytes
+       are the proof: they begin "00 01 2f 72 65 61 64", and the path is "/read". */
+    {
+        struct fuxi_tftp_request r;
+        uint8_t req[64];
+        const uint32_t n = build_request(req, sizeof req, FUXI_TFTP_RRQ, "/readonly/firmware/image/x", 0, 0, 0);
+        CHECK(req[0] == 0 && req[1] == FUXI_TFTP_RRQ);
+        CHECK(req[2] == '/' && req[3] == 'r');
+        CHECK(fuxi_tftp_parse(req, n, &r) == 1);
+        CHECK(strcmp(r.path, "/readonly/firmware/image/x") == 0);
+    }
+
     /* A request that is not one: no path, a mode that is not octet, a string that runs off the end. */
     {
         struct fuxi_tftp_request r;
@@ -240,11 +272,12 @@ int main(void)
         CHECK(strstr(text, "4") != 0);
     }
 
-    /* A write is acknowledged and discarded: nothing is stored, and the file is never opened. */
+    /* A write is acknowledged, and the file is never opened: what the modem writes goes into the
+       adapter's memory, not onto the volume. */
     {
         struct fuxi_tftp_state state;
         memset(&state, 0, sizeof state);
-        opened = 0; sent_count = 0;
+        opened = 0; sent_count = 0; stored_length = 0; stored_calls = 0;
         uint8_t req[256];
         const uint32_t n = build_request(req, sizeof req, FUXI_TFTP_WRQ, "/readwrite/modem_pr/mcfg.mbn", 0, 0, 0);
         uint32_t opcode = 0, wide = 0;
@@ -254,6 +287,36 @@ int main(void)
         CHECK(opened == 0);
         CHECK(sent_count == 1);
         CHECK(sent[0][1] == FUXI_TFTP_ACK);
+    }
+
+    /* The write and the read that follows it: the modem writes a file and then reads it back, and the
+       bytes it wrote come back. This is the round trip the modem does with "/readwrite/mcfg.tmp", and the
+       reference satisfies it by keeping the file in memory (hakios.mpss.c:4214-4236). */
+    {
+        struct fuxi_tftp_state state;
+        memset(&state, 0, sizeof state);
+        opened = 0; sent_count = 0; stored_length = 0; stored_calls = 0;
+        uint8_t req[256];
+        const uint32_t n = build_request(req, sizeof req, FUXI_TFTP_WRQ, "/readwrite/mcfg.tmp", 0, 0, 0);
+        uint32_t opcode = 0, wide = 0;
+        CHECK(fuxi_tftp_serve(&state, FUXI_TFTP_PORT, 0, 40, req, n, &ops, 0, &opcode, &wide) == 1);
+        /* The write is on the service's port; the blocks that follow come on the transfer's own port. */
+        CHECK(sent_port[0] == FUXI_TFTP_TRANSFER_PORT_BASE);
+        /* Two blocks of data. The first is full, the second is short, so the second ends the transfer. */
+        uint8_t data[64];
+        data[0] = 0; data[1] = FUXI_TFTP_DATA; data[2] = 0; data[3] = 1;
+        memcpy(data + 4, "hello", 5);
+        CHECK(fuxi_tftp_serve(&state, FUXI_TFTP_TRANSFER_PORT_BASE, 0, 40, data, 9u, &ops, 0, &opcode,
+                              &wide) == 1);
+        CHECK(opcode == FUXI_TFTP_DATA);
+        CHECK(stored_calls == 1);
+        CHECK(stored_length == 5);
+        CHECK(strcmp(stored_name, "/readwrite/mcfg.tmp") == 0);
+        CHECK(memcmp(stored_bytes, "hello", 5) == 0);
+        /* The block is acknowledged, on the transfer's own port. */
+        CHECK(sent_count == 2u);
+        CHECK(sent[1][1] == FUXI_TFTP_ACK);
+        CHECK(sent[1][2] == 0 && sent[1][3] == 1);
     }
 
     /* A request for a file that is not there is answered with an error, not with a success. */

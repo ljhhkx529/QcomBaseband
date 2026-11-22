@@ -17,21 +17,23 @@
  *
  * The protocol is TFTP's, over a QRTR data packet. The wire shape is:
  *
- *   byte 0     always zero
- *   byte 1     the opcode
- *   bytes 2-3  the block number, big-endian
+ *   bytes 0-1  the opcode, big-endian
  *   then       the path, NUL-terminated, the mode string, NUL-terminated, and the options as pairs of
  *              NUL-terminated name and value
  *
  * and the opcodes are the TFTP ones: RRQ 1, WRQ 2, DATA 3, ACK 4, ERROR 5, OACK 6.
  *
+ * A request carries no block number: the path starts at byte 2. That is what the Linux port reads
+ * (hakios.mpss.c:4311-4312: `name = (const char *)m + 2`), and the device confirms it: on 2026-11-22 the
+ * modem's own requests came in as `00 01 2f 72 65 61 64 ...`, and the path is "/readonly/..." from the
+ * third byte on. A reader that expects a block number there loses the path's first two characters and
+ * answers for a file that does not exist.
+ *
  * The opcode's place is worth naming, because the two references disagree about it: the XNU port for this
  * same modem family reads it out of byte 1 (umi_modem_tftp.h:45), and the Linux port reads it out of the
- * first two bytes as a big-endian number (hakios.mpss.c:4189). The XNU port is the one that ran on a modem
- * of this family, so that is the one this reads. But the disagreement is only about reading, and the
- * difference is visible: byte 1 is the opcode on one side and the high byte of it on the other. So this
- * accepts a request whose opcode is in byte 1, and also one whose opcode is in byte 0 with byte 1 zero,
- * and it says on the log which of the two shapes arrived. The device decides, not this reading.
+ * first two bytes as a big-endian number (hakios.mpss.c:4302). The device's requests have byte 0 zero and
+ * the opcode in byte 1, so both readings give the same number here. This accepts either shape and says on
+ * the log which one arrived, so the device decides rather than this reading.
  *
  * A read is: the modem asks for a file, the host answers with the options it agreed to (or with the first
  * block of the file when the modem asked for no options), and then the modem acknowledges blocks and the
@@ -91,7 +93,9 @@
 #define FUXI_TFTP_MAX_BLKSIZE 65464u
 #define FUXI_TFTP_MIN_BLKSIZE 8u
 #define FUXI_TFTP_MAX_RSIZE (100u << 20)
-/* The block size this port will actually use: what fits in a packet with room to spare. */
+/* The block size this port will actually use: what fits in a packet with room to spare. The modem asks
+   for 7680 (measured on 2026-11-22), which is more than a packet holds, so the answer agrees to less and
+   the modem takes what the OACK says. */
 #define FUXI_TFTP_PACKET_BLKSIZE 4000u
 
 /* The prefixes the modem asks its files under, and what each of them maps to in the modem's own volume.
@@ -103,7 +107,7 @@
 /* One transfer: a file the modem asked for, and where the transfer stands. */
 struct fuxi_tftp_transfer {
     uint8_t used;         /* the slot is taken */
-    uint8_t writer;       /* the modem asked to write, so nothing is stored */
+    uint8_t writer;       /* the modem asked to write */
     uint32_t node;        /* the modem's node */
     uint32_t port;        /* the port the modem asked from */
     uint32_t blksize;     /* the block size in force */
@@ -111,9 +115,11 @@ struct fuxi_tftp_transfer {
     uint32_t blocks;      /* how many blocks the file has */
     uint64_t seek;        /* where in the file the transfer starts */
     uint64_t limit;       /* how many bytes are left after the seek */
+    uint64_t written;     /* how many bytes a writer has sent */
     uint16_t expected;    /* the next block number a writer's data must carry */
     uint8_t slot;         /* which of the transfer slots this one is */
     void *handle;         /* the file the board's adapter opened */
+    char name[256];       /* the name the modem used, for a write */
 };
 
 /* The state the protocol half keeps. */
@@ -185,7 +191,10 @@ static inline int fuxi_tftp_parse(const uint8_t *p, uint32_t n, struct fuxi_tftp
     } else {
         return 0;
     }
-    uint32_t at = 4u;
+    /* A request carries no block number: the path starts at byte 2. A block number would be two bytes of
+       the path, and the modem's own requests begin "00 01 2f 72 65 61 64", which is the opcode and then
+       "/read". */
+    uint32_t at = 2u;
     const char *path = 0;
     uint32_t path_length = 0;
     if (!fuxi_tftp_string(p, n, at, &path, &path_length)) return 0;
@@ -433,15 +442,30 @@ static inline int fuxi_tftp_serve(struct fuxi_tftp_state *state, uint32_t dst_po
             return 1;
         }
         if (opcode == FUXI_TFTP_DATA) {
-            /* A writer's data is acknowledged and discarded: nothing is stored. */
+            /* A writer's data goes into the adapter's memory, under the name the modem used, so the modem
+               can read it back. Nothing is written to the modem's storage: the store is memory, for the
+               run, and the reference does the same (hakios.mpss.c:4214-4236). */
             if (t->writer) {
                 if (block != t->expected) return 0;
                 t->expected++;
-                uint8_t ack[8];
-                const uint32_t n = fuxi_tftp_build_ack(ack, sizeof ack, block);
-                if (!n) return 0;
-                if (!ops->send || ops->send(context, dst_port, t->node, t->port, ack, n)) return 0;
-                state->answered++;
+                const uint32_t n = length - 4u;
+                if (n && ops->store) ops->store(context, t->name, (uint32_t)strlen(t->name), body + 4u, n);
+                t->written += n;
+                /* The acknowledgement comes every wsize blocks, or on the last one, whichever comes first
+                   (hakios.mpss.c:4207-4209 and umi_modem_mhi.inc:838-840). */
+                const int last = n < t->blksize;
+                if (block % t->wsize == 0 || last) {
+                    uint8_t ack[8];
+                    const uint32_t a = fuxi_tftp_build_ack(ack, sizeof ack, block);
+                    if (!a) return 0;
+                    if (!ops->send || ops->send(context, dst_port, t->node, t->port, ack, a)) return 0;
+                    state->answered++;
+                }
+                if (last) {
+                    /* The last block: the file is complete, and the transfer is over. */
+                    memset(t, 0, sizeof *t);
+                }
+                return 1;
             }
             return 1;
         }
@@ -468,9 +492,10 @@ static inline int fuxi_tftp_serve(struct fuxi_tftp_state *state, uint32_t dst_po
     uint8_t out[FUXI_TFTP_PACKET_BLKSIZE + 16u];
 
     if (r.opcode == FUXI_TFTP_WRQ) {
-        /* A write is acknowledged and discarded: the modem's carrier configuration is the radio's own,
-           and rewriting it is not this port's to do. The reference does the same
-           (umi_modem_mhi.inc:787-796). */
+        /* A write goes into the adapter's memory, under the name the modem used, and the modem can read
+           it back. Nothing is written to the modem's storage: the carrier configuration is the radio's
+           own, and rewriting it is not this port's to do. The reference keeps the written file in memory
+           for the run as well (hakios.mpss.c:4214-4236). */
         state->writes++;
         unsigned slot = 0;
         while (slot < FUXI_TFTP_TRANSFER_SLOTS && state->transfer[slot].used) slot++;
@@ -486,6 +511,14 @@ static inline int fuxi_tftp_serve(struct fuxi_tftp_state *state, uint32_t dst_po
         w->port = src_port;
         w->slot = (uint8_t)slot;
         w->expected = 1;
+        w->blksize = r.blksize;
+        w->wsize = r.wsize;
+        /* The name the modem used is kept, so the blocks that follow go under it and a read of the same
+           name finds them. */
+        if (r.path_length < sizeof w->name) {
+            memcpy(w->name, r.path, r.path_length);
+            w->name[r.path_length] = 0;
+        }
         uint32_t n;
         if (r.options) {
             n = fuxi_tftp_build_oack(out, sizeof out, &r, 0);
