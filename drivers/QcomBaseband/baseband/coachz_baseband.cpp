@@ -27,6 +27,7 @@
 #include "coachz_bb_esim.h"
 #include "coachz_bb_ssctl.h"
 #include "coachz_bb_uim_probe.h"
+#include "coachz_bb_nas_probe.h"
 
 #define BB_FRAME_MAX (64u * 1024u)       // one read or write: a QMUX frame, a SAHARA packet or a READ_DATA answer
 // Frames waiting for ABM, per channel. At boot the 53 clients' registrations and indications arrive faster than ABM reads; with 64 the
@@ -96,6 +97,18 @@ static int bb_ssctl_slot = -1;
 // speaks when a client asks it to, and a physical card is not that: reading card slot one is one request.
 static struct cbp_uim bb_uim;
 static int bb_uim_slot = -1;
+
+// The radio, asked for over DMS and NAS (coachz_bb_nas_probe.h). Three read-only requests: whether the radio is
+// on, whether it has registered, and how strong the signal is. Nothing else asks them: the bridge forwards what
+// CommCenter requests, and CommCenter's registration path runs through the Apple private services this modem does
+// not have.
+static struct cbn_probe bb_dms;
+static int bb_dms_slot = -1;
+static struct cbn_probe bb_serving;
+static int bb_serving_slot = -1;
+static struct cbn_probe bb_signal;
+static int bb_signal_slot = -1;
+static struct cbn_radio bb_radio;
 
 static uint32_t bb_now_ms(void)
 {
@@ -451,6 +464,79 @@ static void bb_uim_log(const uint8_t *sdu, uint32_t size)
   for (uint32_t i = 0; i < bb_uim.tlv_count; ++i)
     printf(" type 0x%02x of %u bytes", bb_uim.tlv_types[i], bb_uim.tlv_lens[i]);
   printf("\n");
+}
+
+// One read-only request to one of the radio's services.
+//
+// The request asks for the state and nothing else: it does not set the radio's mode, it does not register, and it
+// writes nothing to the card, so it is safe to send once when the modem has published the service.
+//
+// The request is asked once. A queue that was full is asked again on the next poll, and a request that did go
+// out is not asked again: the radio's state does not change while the modem runs.
+static void bb_radio_ask(struct cbn_probe *probe, int *slot, uint32_t service, uint32_t message, uint32_t txn)
+{
+  const struct cbq_server *server = cbq_server_find(&bb_qmux, service);
+  if (!server) return;
+  if (*slot < 0) *slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, service);
+  if (*slot < 0) return;
+  if (probe->sent || probe->answered) return;
+  uint8_t sdu[32];
+  const uint32_t n = cbn_build_request(sdu, sizeof sdu, txn, message);
+  if (!n) return;
+  const uint32_t queued = bb_tx_count;
+  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)*slot, server->node, server->port, sdu, n);
+  if (bb_tx_count != queued) probe->sent = 1;
+}
+
+// The three requests, in the order they are worth asking in.
+static void bb_radio_step(void)
+{
+  /* Whether the radio is on. A radio that is offline has no signal to report, so the other two are asked
+     anyway: they answer with what they know, and an answer of "not registered" is worth having too. */
+  bb_radio_ask(&bb_dms, &bb_dms_slot, CBN_SVC_DMS, CBN_DMS_GET_OPERATING_MODE, 0x31u);
+  bb_radio_ask(&bb_serving, &bb_serving_slot, CBN_SVC_NAS, CBN_NAS_GET_SERVING_SYSTEM, 0x32u);
+  bb_radio_ask(&bb_signal, &bb_signal_slot, CBN_SVC_NAS, CBN_NAS_GET_SIGNAL_INFO, 0x33u);
+}
+
+// The radio's state, on the record. The numbers are printed as the modem gave them, next to what they mean.
+static const char *bb_mode_name(uint8_t mode)
+{
+  switch (mode) {
+    case CBN_MODE_OFFLINE: return "offline";
+    case CBN_MODE_ONLINE: return "online";
+    case CBN_MODE_LOW_POWER: return "low power";
+    case CBN_MODE_FACTORY_TEST: return "factory test";
+    case CBN_MODE_SHUTTING_DOWN: return "shutting down";
+    case CBN_MODE_PERSIST: return "persist";
+    case CBN_MODE_LOW_POWER_ONLY: return "low power only";
+    default: return "a mode this tree does not name";
+  }
+}
+
+static const char *bb_reg_name(uint8_t state)
+{
+  switch (state) {
+    case CBN_REG_NOT_REGISTERED: return "not registered";
+    case CBN_REG_REGISTERED: return "registered";
+    case CBN_REG_NOT_REGISTERED_SEARCHING: return "not registered, searching";
+    case CBN_REG_REGISTRATION_DENIED: return "registration denied";
+    case CBN_REG_UNKNOWN: return "unknown";
+    default: return "a state this tree does not name";
+  }
+}
+
+static void bb_radio_log(void)
+{
+  if (bb_radio.have_operating_mode)
+    printf("COACHZ baseband: the radio is %s\n", bb_mode_name(bb_radio.operating_mode));
+  if (bb_radio.have_serving)
+    printf("COACHZ baseband: the radio is %s, the packet service is %s\n",
+           bb_reg_name(bb_radio.reg_state), bb_radio.ps_attached ? "attached" : "not attached");
+  if (bb_radio.have_plmn)
+    printf("COACHZ baseband: the radio is on the network %u-%u\n", bb_radio.mcc, bb_radio.mnc);
+  if (bb_radio.have_signal)
+    printf("COACHZ baseband: the signal is %d dBm, the quality %d, the power %d dBm, the SNR %d dB\n",
+           bb_radio.rssi, bb_radio.rsrq, bb_radio.rsrp, bb_radio.snr);
 }
 
 // eSIM control runs on the same QRTR owner as the other QMI traffic (bb_lock held).
@@ -1309,6 +1395,42 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
       bb_uim.tlv_count = 0;
       const int read = cbp_read_answer(&bb_uim, sdu, size);
       if (read) { bb_uim.answered = 1; bb_uim_log(sdu, size); }
+    } else if (bb_dms_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_dms_slot &&
+               r.service == CBN_SVC_DMS) {
+      // The modem's answer about the radio's power state.
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      bb_dms.tlv_count = 0;
+      const int read = cbn_read_answer(&bb_dms, sdu, size);
+      if (read) {
+        bb_dms.answered = 1;
+        cbn_take_operating_mode(&bb_radio, sdu, size);
+        printf("COACHZ baseband: the DMS answer: error %u, %u TLVs\n", bb_dms.error, bb_dms.tlv_count);
+        bb_radio_log();
+      }
+    } else if (bb_serving_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_serving_slot &&
+               r.service == CBN_SVC_NAS) {
+      // The modem's answer about the network the radio is on.
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      bb_serving.tlv_count = 0;
+      const int read = cbn_read_answer(&bb_serving, sdu, size);
+      if (read) {
+        bb_serving.answered = 1;
+        cbn_take_serving_system(&bb_radio, sdu, size);
+        printf("COACHZ baseband: the serving system answer: error %u, %u TLVs\n", bb_serving.error, bb_serving.tlv_count);
+        bb_radio_log();
+      }
+    } else if (bb_signal_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_signal_slot &&
+               r.service == CBN_SVC_NAS) {
+      // The modem's answer about the signal strength.
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      bb_signal.tlv_count = 0;
+      const int read = cbn_read_answer(&bb_signal, sdu, size);
+      if (read) {
+        bb_signal.answered = 1;
+        cbn_take_signal(&bb_radio, sdu, size);
+        printf("COACHZ baseband: the signal answer: error %u, %u TLVs\n", bb_signal.error, bb_signal.tlv_count);
+        bb_radio_log();
+      }
     } else if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
       cbe_answer(&bb_esim, static_cast<const uint8_t *>(body), size, bb_now_ms());
     } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
@@ -1343,6 +1465,7 @@ extern "C" void coachz_baseband_poll(void)
   IOLockLock(bb_lock);
   bb_ssctl_step();
   bb_uim_step();
+  bb_radio_step();
   bb_esim_step();
   while (bb_tx_count && n < 16) {
     batch[n++] = bb_txq[bb_tx_head];
@@ -1418,6 +1541,17 @@ extern "C" void coachz_baseband_report(unsigned second)
     printf("COACHZ baseband: %u s: the card's slot status: error %u, %u TLVs\n", second, bb_uim.error, bb_uim.tlv_count);
   else if (bb_uim.sent)
     printf("COACHZ baseband: %u s: the card's slot status was asked for, no answer yet\n", second);
+  /* The state of the radio. */
+  if (bb_radio.have_operating_mode || bb_radio.have_serving || bb_radio.have_signal) {
+    printf("COACHZ baseband: %u s: the radio:", second);
+    if (bb_radio.have_operating_mode) printf(" %s", bb_mode_name(bb_radio.operating_mode));
+    if (bb_radio.have_serving) printf(" %s", bb_reg_name(bb_radio.reg_state));
+    if (bb_radio.have_plmn) printf(" on %u-%u", bb_radio.mcc, bb_radio.mnc);
+    if (bb_radio.have_signal) printf(", the signal %d dBm", bb_radio.rssi);
+    printf("\n");
+  } else if (bb_dms.sent || bb_serving.sent || bb_signal.sent) {
+    printf("COACHZ baseband: %u s: the radio was asked for, no answer yet\n", second);
+  }
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) {
     const bb_channel *ch = &bb_ch[c];
     if (ch->opens)
