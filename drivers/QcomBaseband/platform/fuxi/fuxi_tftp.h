@@ -389,10 +389,21 @@ static inline int fuxi_tftp_send_block(struct fuxi_tftp_state *state, struct fux
  * same: an ACK of n sends the blocks n+1 to n+wsize (umi_modem_mhi.inc:838-840). The last block of the
  * file is the short one, so the window ends there.
  *
+ * The transfer is over once the modem has acknowledged the last block, and the slot it held is freed
+ * then: the reference frees it on exactly that condition (umi_modem_mhi.inc:838, an acknowledgement of
+ * the last block closes the transfer). The slot is not freed when the last block goes out, because the
+ * modem still has to acknowledge it and the slot must still be there to answer it.
+ *
  * Returns 1 when the window went out. */
 static inline int fuxi_tftp_answer_ack(struct fuxi_tftp_state *state, struct fuxi_tftp_transfer *t,
                                        const struct fuxi_tftp_ops *ops, void *context, uint16_t acked)
 {
+    if ((uint32_t)acked >= t->blocks) {
+        /* The modem has the whole file: the transfer is over and the slot is free. */
+        if (t->handle && ops->close) ops->close(context, t->handle);
+        memset(t, 0, sizeof *t);
+        return 1;
+    }
     for (uint32_t block = (uint32_t)acked + 1u; block <= (uint32_t)acked + t->wsize; ++block) {
         if (block > t->blocks) break;
         const int over = fuxi_tftp_send_block(state, t, ops, context, block);
@@ -574,10 +585,15 @@ static inline int fuxi_tftp_serve(struct fuxi_tftp_state *state, uint32_t dst_po
     t->handle = handle;
 
     if (r.options) {
-        /* The modem asked for options, so the answer agrees to them and the file itself follows. */
+        /* The modem asked for options, so the answer agrees to them and the file itself follows.
+           The answer goes out from the transfer's own port, which is what tells the modem which transfer
+           it belongs to: the modem sends its acknowledgements and its errors back to the port the
+           answer came from, and a service port has no transfer waiting on it. The reference sends the
+           read's answer from the transfer port too (umi_modem_mhi.inc:784, the same src for the write
+           and for the read). */
         const uint32_t n = fuxi_tftp_build_oack(out, sizeof out, &r, size);
         if (!n) return 0;
-        if (!ops->send || ops->send(context, dst_port, src_node, src_port, out, n)) return 0;
+        if (!ops->send || ops->send(context, FUXI_TFTP_TRANSFER_PORT_BASE + slot, src_node, src_port, out, n)) return 0;
     } else {
         /* No options: the first block of the file goes straight out. */
         if (fuxi_tftp_send_block(state, t, ops, context, 1u) < 0) return 0;

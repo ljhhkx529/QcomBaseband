@@ -471,6 +471,16 @@ static int fuxi_tftp_send(void *context, uint32_t src_port, uint32_t dst_node, u
                           uint32_t length)
 {
     fuxi_modem_link *link = context;
+    /* The port an answer goes out on is what tells the modem which transfer it belongs to, and the modem
+       sends its acknowledgements and its errors back to that port. A wrong port is in the hex dump but
+       only readable by counting bytes, so the options answer says its own port in words. */
+    if (body && length >= 2u) {
+        const uint32_t opcode = body[1] ? body[1] : body[0];
+        if (opcode == FUXI_TFTP_OACK) {
+            printf("FUXI_MODEM: the tftp: the options answer goes out from port %u (0x%04x), to node %u port %u\n",
+                   src_port, src_port, dst_node, dst_port);
+        }
+    }
     return qrtr_send_data(&link->qrtr, src_port, dst_node, dst_port, body, length);
 }
 
