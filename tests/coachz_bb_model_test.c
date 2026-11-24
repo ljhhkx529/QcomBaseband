@@ -9,6 +9,7 @@
 #include "coachz_bb_data.h"
 #include "coachz_bb_pdp.h"
 #include "coachz_bb_esim.h"
+#include "coachz_bb_ssctl.h"
 
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
@@ -821,6 +822,60 @@ static void test_esim_cache(void)
     if (!failures) printf("PASS esim read-only query cache\n");
 }
 
+/* The modem's failure reason, asked for over SSCTL. */
+static void test_ssctl(void)
+{
+    static struct cbq_ssctl st;
+    uint8_t sdu[64];
+
+    /* The request: a QMI request with no TLVs. */
+    const uint32_t n = cbs_build_request_id(sdu, sizeof sdu, 0x2a, CBS_SSCTL_GET_FAILURE_REASON);
+    CHECK(n == 7);
+    CHECK(sdu[0] == 0x00);
+    CHECK(sdu[1] == 0x2a);
+    CHECK(cbd_rd16(sdu + 3) == CBS_SSCTL_GET_FAILURE_REASON);
+    CHECK(cbd_rd16(sdu + 5) == 0);
+
+    /* The answer: the result TLV and the failure reason. */
+    memset(&st, 0, sizeof st);
+    const char reason[] = "subsystem restarted";
+    uint32_t at = 7;
+    sdu[0] = 0x02;                       /* flags: a response */
+    sdu[1] = 0x2a;                       /* the same transaction */
+    cbd_wr16(sdu + 3, CBS_SSCTL_GET_FAILURE_REASON);
+    /* the result TLV: type 0x02, the error code in the last two bytes */
+    sdu[at] = CBS_TLV_RESULT; cbd_wr16(sdu + at + 1, 2); cbd_wr16(sdu + at + 3, 0); at += 5;
+    /* the reason TLV: type 0x10, the message as text */
+    sdu[at] = CBS_TLV_FAILURE_MESSAGE; cbd_wr16(sdu + at + 1, sizeof reason); memcpy(sdu + at + 3, reason, sizeof reason);
+    at += 3 + sizeof reason;
+    cbd_wr16(sdu + 5, at - 7);
+    CHECK(cbs_read_answer(&st, sdu, at));
+    CHECK(st.answered);
+    CHECK(st.error == 0);
+    CHECK(st.reason_len == sizeof reason);
+    CHECK(strcmp(st.reason, reason) == 0);
+
+    /* An answer that reports an error carries no reason. */
+    memset(&st, 0, sizeof st);
+    sdu[0] = 0x02; sdu[1] = 0x2a;
+    cbd_wr16(sdu + 3, CBS_SSCTL_GET_FAILURE_REASON);
+    sdu[7] = CBS_TLV_RESULT; cbd_wr16(sdu + 8, 2); cbd_wr16(sdu + 10, 94);  /* 94: not supported */
+    cbd_wr16(sdu + 5, 5);
+    CHECK(cbs_read_answer(&st, sdu, 12));
+    CHECK(st.error == 94);
+    CHECK(st.reason_len == 0);
+
+    /* A truncated answer is not an answer. */
+    memset(&st, 0, sizeof st);
+    CHECK(!cbs_read_answer(&st, sdu, 9));
+    CHECK(!st.answered);
+
+    /* The two SSCTL messages that stop the modem are named here so that they are never sent by accident. */
+    CHECK(CBS_SSCTL_RESTART == 0x0020);
+    CHECK(CBS_SSCTL_SHUTDOWN == 0x0021);
+    CHECK(CBS_SSCTL_GET_FAILURE_REASON == 0x0022);
+}
+
 int main(void)
 {
     test_qmux();
@@ -832,5 +887,6 @@ int main(void)
     test_data();
     test_esim();
     test_esim_cache();
+    test_ssctl();
     return failures ? 1 : 0;
 }

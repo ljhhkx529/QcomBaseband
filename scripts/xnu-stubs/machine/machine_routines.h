@@ -1,0 +1,3 @@
+#ifndef STUB_MACHINE_ROUTINES_H
+#define STUB_MACHINE_ROUTINES_H
+#endif

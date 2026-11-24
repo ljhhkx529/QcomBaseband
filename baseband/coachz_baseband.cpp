@@ -15,6 +15,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <libkern/c++/OSData.h>
+#include <libkern/c++/OSCollectionIterator.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>
 
@@ -25,6 +26,9 @@
 #include "coachz_bb_data.h"
 #include "coachz_bb_pdp.h"
 #include "coachz_bb_esim.h"
+#include "coachz_bb_ssctl.h"
+#include "coachz_bb_uim_probe.h"
+#include "coachz_bb_nas_probe.h"
 
 #define BB_FRAME_MAX (64u * 1024u)       // one read or write: a QMUX frame, a SAHARA packet or a READ_DATA answer
 // Frames waiting for ABM, per channel. At boot the 53 clients' registrations and indications arrive faster than ABM reads; with 64 the
@@ -61,7 +65,12 @@ static struct cbc_state bb_control;
 static bb_channel bb_ch[CBH_PUBLISHED];
 static bb_tx bb_txq[BB_TX];
 static uint32_t bb_tx_head, bb_tx_count, bb_tx_dropped;
-static void (*bb_send)(uint32_t local_port, uint32_t node, uint32_t port, const void *message, uint32_t length);
+/* The refusals the link made since the last time they were reported. */
+static uint32_t bb_tx_refused;
+static uint32_t bb_refused_last;
+/* Whether the last send went out. A send that the link refused (no room, or the peer is out of credit) has to be
+   tried again, so the bridge asks. */
+static int (*bb_send)(uint32_t local_port, uint32_t node, uint32_t port, const void *message, uint32_t length);
 static void (*bb_del_client)(uint32_t local_port);
 static int bb_published;
 static uint32_t bb_private_seen[64], bb_private_count, bb_ctl_logged;
@@ -80,6 +89,28 @@ static uint8_t bb_uim_cid[BB_TX];
 static uint8_t *bb_esim_in, *bb_esim_resp;
 #define BB_ESIM_BYTES (1024u * 1024u)
 
+// The modem's own list of its services, asked for over SSCTL (coachz_bb_ssctl.h). The name service does not
+// answer this modem, so the list has to be asked of the modem itself.
+static struct cbq_ssctl bb_ssctl;
+static int bb_ssctl_slot = -1;
+
+// The state of the SIM in the card slot, asked for over UIM (coachz_bb_uim_probe.h). The eSIM control only
+// speaks when a client asks it to, and a physical card is not that: reading card slot one is one request.
+static struct cbp_uim bb_uim;
+static int bb_uim_slot = -1;
+
+// The radio, asked for over DMS and NAS (coachz_bb_nas_probe.h). Three read-only requests: whether the radio is
+// on, whether it has registered, and how strong the signal is. Nothing else asks them: the bridge forwards what
+// CommCenter requests, and CommCenter's registration path runs through the Apple private services this modem does
+// not have.
+static struct cbn_probe bb_dms;
+static int bb_dms_slot = -1;
+static struct cbn_probe bb_serving;
+static int bb_serving_slot = -1;
+static struct cbn_probe bb_signal;
+static int bb_signal_slot = -1;
+static struct cbn_radio bb_radio;
+
 static uint32_t bb_now_ms(void)
 {
   uint64_t ticks, ns;
@@ -90,7 +121,7 @@ static uint32_t bb_now_ms(void)
 
 extern "C" {
 int coachz_baseband_enabled(void);
-void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t));
+void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t));
 void coachz_baseband_new_server(uint32_t service, uint32_t version_instance, uint32_t node, uint32_t port);
 void coachz_baseband_del_server(uint32_t service, uint32_t node, uint32_t port);
 int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body, uint32_t size);
@@ -236,6 +267,60 @@ static void bb_queue_tx(uint32_t local_port, uint32_t node, uint32_t port, const
 // HELLO goes out when sahara opens after a SendImage.
 static bool bb_boot_image_sent;
 
+// ------------------------------------------------------------------ operating mode after a boot (bb_lock held)
+// ABM powers the baseband up at every start and the bridge stands for that boot (bb_sahara_restart) while the
+// modem keeps running, so the modem keeps whatever mode it had. A baseband that ABM has just booted comes up in
+// low power: CommCenter logs "Baseband booted in airplane mode", and its subscription switch waits for
+// /cc/props/radio_state to reach Offline, which only the modem's low-power report gives. On the reference board
+// the modem never left the mode CommCenter reads as Shutdown, so the switch never went on and the SIM stayed
+// unknown, with no service. After each such boot the bridge's own DMS client reads the mode and puts the modem
+// in low power (QMI DMS Get/Set Operating Mode 0x002d/0x002e, TLV 0x01 u8: 0 online, 1 low power); CommCenter
+// then takes it online itself. Layouts are libqmi's (qmi-service-dms).
+static const uint32_t BB_DMS = 0x02u, BB_DMS_GET_MODE = 0x002du, BB_DMS_SET_MODE = 0x002eu;
+static uint8_t bb_lpm_pending, bb_lpm_step;
+/* Without ABM nothing opens the sahara channel, so the handshake above would never run and its QMI could not be
+   checked. This runs it once, on the bridge's own first DMS answer, when the boot argument asks for it. */
+static uint8_t bb_lpm_once, bb_lpm_tried;
+static uint32_t bb_lpm_txn = 0x4c00;
+static void bb_lpm_send(void)
+{
+  const struct cbq_server *server = cbq_server_find(&bb_qmux, BB_DMS);
+  if (!server) { if (bb_lpm_step == 0) bb_lpm_pending = 1; return; }   // DMS not announced yet: try again on the next frame
+  if (bb_dms_slot < 0) bb_dms_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, BB_DMS);
+  if (bb_dms_slot < 0) { printf("COACHZ baseband: operating mode: no DMS client\n"); bb_lpm_pending = 0; return; }
+  uint8_t sdu[16];
+  uint32_t n;
+  bb_lpm_txn++;
+  if (bb_lpm_step == 0) {
+    n = cbd_request(sdu, bb_lpm_txn, BB_DMS_GET_MODE, 0);
+  } else {
+    const uint8_t low_power = 1;
+    n = cbd_request(sdu, bb_lpm_txn, BB_DMS_SET_MODE, cbd_tlv(sdu + 7, sizeof sdu - 7u, 0x01, &low_power, 1));
+  }
+  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_dms_slot, server->node, server->port, sdu, n);
+}
+// An answer on the bridge's DMS client: 1 when it was one.
+static int bb_lpm_answer(uint32_t dst_port, const uint8_t *sdu, uint32_t n)
+{
+  if (bb_dms_slot < 0 || dst_port != CBQ_PORT_BASE + (uint32_t)bb_dms_slot) return 0;
+  /* Not our transaction: this client is shared with the radio probe (bb_radio_step), which asks its own question on
+     the same DMS client, so an answer that is not ours has to fall through to that probe. The reference has this
+     client to itself and may swallow anything, which is why its return value here cannot be copied as it stands. */
+  if (n < 7u || sdu[0] != 0x02 || cbd_rd16(sdu + 1) != bb_lpm_txn) return 0;
+  const uint32_t error = cbd_error(sdu, n);
+  if (bb_lpm_step == 0) {
+    uint32_t len = 0;
+    const uint8_t *mode = cbd_find(sdu, n, 0x01, &len);
+    printf("COACHZ baseband: operating mode after the boot: %d (error 0x%x), setting low power\n",
+           mode && len >= 1 ? (int)mode[0] : -1, error);
+    bb_lpm_step = 1;
+    bb_lpm_send();
+  } else {
+    printf("COACHZ baseband: operating mode set to low power: error 0x%x\n", error);
+    bb_lpm_pending = 0;
+  }
+  return 1;
+}
 static void bb_sahara_restart(void)
 {
   struct cbs_out o;
@@ -243,6 +328,8 @@ static void bb_sahara_restart(void)
   cbs_init(&bb_sahara, bb_sahara_images, sizeof bb_sahara_images / sizeof bb_sahara_images[0], 0x10000);
   cbs_start(&bb_sahara, &o);
   for (uint32_t i = 0; i < o.count; i++) bb_push(CBH_SAHARA, o.data[i], o.len[i]);
+  bb_lpm_pending = 1;
+  bb_lpm_step = 0;
   printf("COACHZ baseband: sahara hello\n");
 }
 
@@ -351,6 +438,162 @@ static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
     printf("COACHZ baseband: data port: service %u message 0x%x endpoint %u/%u %s %u/%u\n", r.service, (uint32_t)(sdu[3] | sdu[4] << 8),
            f.before_type, f.before_interface, f.inserted ? "added as" : "now", CBD_EP_EMBEDDED, CBD_EP_INTERFACE);
   bb_queue_tx(r.local_port, r.node, r.port, bb_fix, f.len);
+}
+
+// The modem's answer about itself, on the record.
+static void bb_ssctl_log(const uint8_t *sdu, uint32_t size)
+{
+  printf("COACHZ baseband: the SSCTL answer: error %u, %u bytes of reason\n", bb_ssctl.error, bb_ssctl.reason_len);
+  if (bb_ssctl.reason_len) printf("COACHZ baseband: the modem says: %s\n", bb_ssctl.reason);
+  /* The answer's own bytes. The TLV layout of the reason is not in this tree, so the bytes are what settles
+     it: an answer that names a reason and one that does not look different in a way that can be read off the
+     log. */
+  printf("COACHZ baseband: the answer is %u bytes:", size);
+  for (uint32_t i = 0; i < size && i < 64; ++i) printf(" %02x", sdu[i]);
+  printf("\n");
+  printf("COACHZ baseband: the answer carries %u TLVs:", bb_ssctl.tlv_count);
+  for (uint32_t i = 0; i < bb_ssctl.tlv_count; ++i)
+    printf(" type 0x%02x of %u bytes", bb_ssctl.tlv_types[i], bb_ssctl.tlv_lens[i]);
+  printf("\n");
+}
+
+// The one SSCTL request that is safe to send: the failure reason.
+//
+// The SSCTL service is subsystem control, and two of its four messages stop the modem: 0x0020 restarts the
+// modem's subsystem and 0x0021 shuts it down. The earlier sweep of the message ids was asking for exactly
+// those, one id a second, and the modem stopped answering because it had been told to stop. The ids 0x0020
+// and 0x0021 are never sent from here.
+//
+// What is asked instead is id 0x0022, the failure reason, which takes no TLVs and only reads. It is asked
+// once, and only after the modem has been quiet for a while, because a modem that is running has no failure
+// to report and the answer would be empty. The reason is the modem's own statement of why it stopped, which
+// is the one thing the log cannot work out on its own.
+static void bb_ssctl_step(void)
+{
+  const struct cbq_server *server = cbq_server_find(&bb_qmux, CBS_SVC_SSCTL);
+  if (!server) return;
+  if (bb_ssctl_slot < 0) bb_ssctl_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, CBS_SVC_SSCTL);
+  if (bb_ssctl_slot < 0) return;
+  if (bb_ssctl.sent || bb_ssctl.answered) return;
+  uint8_t sdu[32];
+  const uint32_t n = cbs_build_request_id(sdu, sizeof sdu, 0x22u, CBS_SSCTL_GET_FAILURE_REASON);
+  if (!n) return;
+  const uint32_t queued = bb_tx_count;
+  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_ssctl_slot, server->node, server->port, sdu, n);
+  /* The request is asked once. A queue that was full is asked again on the next poll, and a request that did
+     go out is not asked again: the failure reason does not change while the modem runs. */
+  if (bb_tx_count != queued) bb_ssctl.sent = 1;
+}
+
+// One request to the modem's UIM service: the status of the card slots (coachz_bb_uim_probe.h).
+//
+// The request asks for the state of the card and nothing else. It does not switch the slot, it does not
+// authenticate and it writes nothing to the card, so it is safe to send once when the modem has published UIM.
+//
+// The request is asked once. A queue that was full is asked again on the next poll, and a request that did go
+// out is not asked again: the card's state does not change while the modem runs.
+static void bb_uim_step(void)
+{
+  const struct cbq_server *server = cbq_server_find(&bb_qmux, CBP_SVC_UIM);
+  if (!server) return;
+  if (bb_uim_slot < 0) bb_uim_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, CBP_SVC_UIM);
+  if (bb_uim_slot < 0) return;
+  if (bb_uim.sent || bb_uim.answered) return;
+  uint8_t sdu[32];
+  const uint32_t n = cbp_build_request(sdu, sizeof sdu, 0x23u, CBP_UIM_GET_SLOT_STATUS);
+  if (!n) return;
+  const uint32_t queued = bb_tx_count;
+  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_uim_slot, server->node, server->port, sdu, n);
+  if (bb_tx_count != queued) bb_uim.sent = 1;
+}
+
+// The modem's answer about the card, on the record.
+static void bb_uim_log(const uint8_t *sdu, uint32_t size)
+{
+  printf("COACHZ baseband: the UIM answer: error %u, %u TLVs\n", bb_uim.error, bb_uim.tlv_count);
+  /* The answer's own bytes. The TLV layout of the slot status is not in this tree, so the bytes are what
+     settles it: an answer that names a card and one that does not look different in a way that can be read off
+     the log. */
+  printf("COACHZ baseband: the answer is %u bytes:", size);
+  for (uint32_t i = 0; i < size && i < 96; ++i) printf(" %02x", sdu[i]);
+  printf("\n");
+  printf("COACHZ baseband: the answer carries %u TLVs:", bb_uim.tlv_count);
+  for (uint32_t i = 0; i < bb_uim.tlv_count; ++i)
+    printf(" type 0x%02x of %u bytes", bb_uim.tlv_types[i], bb_uim.tlv_lens[i]);
+  printf("\n");
+}
+
+// One read-only request to one of the radio's services.
+//
+// The request asks for the state and nothing else: it does not set the radio's mode, it does not register, and it
+// writes nothing to the card, so it is safe to send once when the modem has published the service.
+//
+// The request is asked once. A queue that was full is asked again on the next poll, and a request that did go
+// out is not asked again: the radio's state does not change while the modem runs.
+static void bb_radio_ask(struct cbn_probe *probe, int *slot, uint32_t service, uint32_t message, uint32_t txn)
+{
+  const struct cbq_server *server = cbq_server_find(&bb_qmux, service);
+  if (!server) return;
+  if (*slot < 0) *slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, service);
+  if (*slot < 0) return;
+  if (probe->sent || probe->answered) return;
+  uint8_t sdu[32];
+  const uint32_t n = cbn_build_request(sdu, sizeof sdu, txn, message);
+  if (!n) return;
+  const uint32_t queued = bb_tx_count;
+  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)*slot, server->node, server->port, sdu, n);
+  if (bb_tx_count != queued) probe->sent = 1;
+}
+
+// The three requests, in the order they are worth asking in.
+static void bb_radio_step(void)
+{
+  /* Whether the radio is on. A radio that is offline has no signal to report, so the other two are asked
+     anyway: they answer with what they know, and an answer of "not registered" is worth having too. */
+  bb_radio_ask(&bb_dms, &bb_dms_slot, CBN_SVC_DMS, CBN_DMS_GET_OPERATING_MODE, 0x31u);
+  bb_radio_ask(&bb_serving, &bb_serving_slot, CBN_SVC_NAS, CBN_NAS_GET_SERVING_SYSTEM, 0x32u);
+  bb_radio_ask(&bb_signal, &bb_signal_slot, CBN_SVC_NAS, CBN_NAS_GET_SIGNAL_INFO, 0x33u);
+}
+
+// The radio's state, on the record. The numbers are printed as the modem gave them, next to what they mean.
+static const char *bb_mode_name(uint8_t mode)
+{
+  switch (mode) {
+    case CBN_MODE_OFFLINE: return "offline";
+    case CBN_MODE_ONLINE: return "online";
+    case CBN_MODE_LOW_POWER: return "low power";
+    case CBN_MODE_FACTORY_TEST: return "factory test";
+    case CBN_MODE_SHUTTING_DOWN: return "shutting down";
+    case CBN_MODE_PERSIST: return "persist";
+    case CBN_MODE_LOW_POWER_ONLY: return "low power only";
+    default: return "a mode this tree does not name";
+  }
+}
+
+static const char *bb_reg_name(uint8_t state)
+{
+  switch (state) {
+    case CBN_REG_NOT_REGISTERED: return "not registered";
+    case CBN_REG_REGISTERED: return "registered";
+    case CBN_REG_NOT_REGISTERED_SEARCHING: return "not registered, searching";
+    case CBN_REG_REGISTRATION_DENIED: return "registration denied";
+    case CBN_REG_UNKNOWN: return "unknown";
+    default: return "a state this tree does not name";
+  }
+}
+
+static void bb_radio_log(void)
+{
+  if (bb_radio.have_operating_mode)
+    printf("COACHZ baseband: the radio is %s\n", bb_mode_name(bb_radio.operating_mode));
+  if (bb_radio.have_serving)
+    printf("COACHZ baseband: the radio is %s, the packet service is %s\n",
+           bb_reg_name(bb_radio.reg_state), bb_radio.ps_attached ? "attached" : "not attached");
+  if (bb_radio.have_plmn)
+    printf("COACHZ baseband: the radio is on the network %u-%u\n", bb_radio.mcc, bb_radio.mnc);
+  if (bb_radio.have_signal)
+    printf("COACHZ baseband: the signal is %d dBm, the quality %d, the power %d dBm, the SNR %d dB\n",
+           bb_radio.rssi, bb_radio.rsrq, bb_radio.rsrp, bb_radio.snr);
 }
 
 // eSIM control runs on the same QRTR owner as the other QMI traffic (bb_lock held).
@@ -668,6 +911,15 @@ static void bb_reply(IOExternalMethodArguments *args, IOReturn result, uint32_t 
 }
 
 // ------------------------------------------------------------------ AppleBasebandPCIInterface
+/* Which service ABM opens, and with which client type: the board-class open and the PCI control open say
+ * different things about how far the baseband stack came, and a channel open that never happens is the
+ * difference between "ABM never touched it" and "ABM stopped after the board class". */
+static void bb_note_open(const char *name, UInt32 type, uint32_t *seen)
+{
+  const uint32_t n = __atomic_fetch_add(seen, 1u, __ATOMIC_RELAXED);
+  if (n < 4) printf("COACHZ baseband: %s user client %u, type %u\n", name, n + 1, (unsigned)type);
+}
+
 class AppleBasebandPCIUserClient : public IOUserClient {
   OSDeclareDefaultStructors(AppleBasebandPCIUserClient)
   task_t fTask;
@@ -913,7 +1165,7 @@ public:
     *out = nullptr;
     static uint32_t seen;
     if (!(__atomic_fetch_or(&seen, 1u << fChannel, __ATOMIC_RELAXED) & (1u << fChannel)))
-      printf("COACHZ baseband: first user client on %s\n", cbh_published[fChannel]);
+      printf("COACHZ baseband: first user client on %s, type %u\n", cbh_published[fChannel], (unsigned)type);
     AppleBasebandPCIUserClient *client = OSTypeAlloc(AppleBasebandPCIUserClient);
     if (!client) return kIOReturnNoMemory;
     client->setChannel(fChannel);
@@ -1005,7 +1257,7 @@ public:
   IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
   {
     static uint32_t seen;
-    if (!__atomic_exchange_n(&seen, 1, __ATOMIC_RELAXED)) printf("COACHZ baseband: first user client on AppleBasebandPCIControl\n");
+    bb_note_open("AppleBasebandPCIControl", type, &seen);
     return bb_open<AppleBasebandPCIControlUserClient>(this, t, s, type, p, out);
   }
   IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
@@ -1047,6 +1299,10 @@ class AppleBaseband : public IOService {
 public:
   IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
   {
+    /* The one open that told us nothing until now: the PCI control and every channel print, this did not, so a log
+       without it could not tell "ABM never touched the baseband" from "ABM opened it and stopped". */
+    static uint32_t seen;
+    bb_note_open("AppleBaseband", type, &seen);
     return bb_open<AppleBasebandUserClient>(this, t, s, type, p, out);
   }
   IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
@@ -1100,6 +1356,8 @@ class AppleIPAppender : public IOService {
 public:
   IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
   {
+    static uint32_t seen;
+    bb_note_open("AppleIPAppender", type, &seen);
     return bb_open<AppleIPAppenderUserClient>(this, t, s, type, p, out);
   }
   IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
@@ -1123,11 +1381,29 @@ class AppleBasebandPCIMAVPDPManager : public AppleBasebandPCIPDPManager {
 OSDefineMetaClassAndStructors(AppleBasebandPCIMAVPDPManager, AppleBasebandPCIPDPManager)
 
 // ------------------------------------------------------------------ publication and the Wi-Fi thread's entry points
+/* `node`: a device-tree node whose name and properties the service takes, the way a DT-backed nub would.
+ * libTelephonyBaseband finds the board with IOServiceNameMatching("baseband") and reads its "config"
+ * (_TelephonyBasebandControllerLoadConfigOnce), so a service published without the node's name and properties
+ * is invisible to the baseband manager: ABM never opens it. Same publication the reference implementation uses. */
 template <class Service>
-static Service *bb_publish(IOService *provider, uint32_t channel = ~0u)
+static Service *bb_publish(IOService *provider, uint32_t channel = ~0u, const char *node = nullptr)
 {
   Service *service = OSTypeAlloc(Service);
   bool ok = service && service->init();
+  if (ok && node) {
+    IORegistryEntry *dt = IORegistryEntry::fromPath(node, gIODTPlane);
+    OSDictionary *props = dt ? dt->dictionaryWithProperties() : nullptr;
+    OSCollectionIterator *keys = props ? OSCollectionIterator::withCollection(props) : nullptr;
+    while (OSSymbol *key = keys ? OSDynamicCast(OSSymbol, keys->getNextObject()) : nullptr)
+      service->setProperty(key, props->getObject(key));
+    service->setName(dt ? dt->getName() : "baseband");
+    printf("COACHZ baseband: %s took %u properties from IODeviceTree:%s (config %s), name %s\n",
+           service->getMetaClass()->getClassName(), props ? props->getCount() : 0u, node,
+           props && props->getObject("config") ? "present" : "MISSING", service->getName());
+    OSSafeReleaseNULL(keys);
+    OSSafeReleaseNULL(props);
+    OSSafeReleaseNULL(dt);
+  }
   if (ok && channel != ~0u) {
     AppleBasebandPCIInterface *interface = OSDynamicCast(AppleBasebandPCIInterface, service);
     ok = interface && interface->setup(channel);
@@ -1146,16 +1422,20 @@ static Service *bb_publish(IOService *provider, uint32_t channel = ~0u)
 }
 
 // The modem's QRTR is up (GLINK started): publish the services ABM looks for. `send` and `del_client` run on the Wi-Fi thread only.
-extern "C" void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t))
+extern "C" void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*del_client)(uint32_t))
 {
   if (!coachz_baseband_enabled() || bb_published) return;
   bb_init();
   bb_pdp_init();
   bb_send = send;
   bb_del_client = del_client;
+  {
+    uint32_t once = 0;
+    if (PE_parse_boot_argn("sheng-bb-lpm", &once, sizeof once) && once) bb_lpm_once = 1;
+  }
   IOService *provider = IOService::getResourceService();
   int made = 0;
-  made += provider && bb_publish<AppleBaseband>(provider);
+  made += provider && bb_publish<AppleBaseband>(provider, ~0u, "/baseband");
   made += provider && bb_publish<AppleBasebandPCIControl>(provider);
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) made += provider && bb_publish<AppleBasebandPCIInterface>(provider, c);
   made += provider && bb_publish<AppleBasebandPCIMAVPDPManager>(provider);
@@ -1191,7 +1471,69 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
   const struct cbq_result r = cbq_from_modem(&bb_qmux, dst_port, src_node, static_cast<const uint8_t *>(body), size, bb_out, sizeof bb_out);
   if (r.kind == CBQ_TO_HOST && r.channel == CBQ_INTERNAL) {
     bb_trace("int-rx", 0, r.service, r.cid, static_cast<const uint8_t *>(body), size);
-    if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
+    if (bb_ssctl_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_ssctl_slot &&
+        r.service == CBS_SVC_SSCTL) {
+      // The modem's answer to the failure reason request.
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      /* The TLVs of this answer only: the counter is cleared before the answer is read, so the types the log
+         shows are the ones this answer carried. */
+      bb_ssctl.tlv_count = 0;
+      const int read = cbs_read_answer(&bb_ssctl, sdu, size);
+      if (read) bb_ssctl_log(sdu, size);
+    } else if (bb_uim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_uim_slot &&
+               r.service == CBP_SVC_UIM) {
+      // The modem's answer to the slot status request.
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      /* The TLVs of this answer only: the counter is cleared before the answer is read, so the types the log
+         shows are the ones this answer carried. */
+      bb_uim.tlv_count = 0;
+      const int read = cbp_read_answer(&bb_uim, sdu, size);
+      if (read) { bb_uim.answered = 1; bb_uim_log(sdu, size); }
+    } else if (bb_dms_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_dms_slot && bb_lpm_answer(dst_port, static_cast<const uint8_t *>(body), size)) {
+      /* The low-power handshake above owns this client while it runs. */
+    } else if (bb_dms_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_dms_slot &&
+               r.service == CBN_SVC_DMS) {
+      // The modem's answer about the radio's power state.
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      bb_dms.tlv_count = 0;
+      const int read = cbn_read_answer(&bb_dms, sdu, size);
+      if (read) {
+        bb_dms.answered = 1;
+        cbn_take_operating_mode(&bb_radio, sdu, size);
+        printf("COACHZ baseband: the DMS answer: error %u, %u TLVs\n", bb_dms.error, bb_dms.tlv_count);
+        bb_radio_log();
+        if (bb_lpm_once && !bb_lpm_tried) {
+          bb_lpm_tried = 1;
+          printf("COACHZ baseband: exercising the boot operating-mode handshake (no ABM is driving the baseband)\n");
+          bb_lpm_pending = 1;
+          bb_lpm_step = 0;
+        }
+      }
+    } else if (bb_serving_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_serving_slot &&
+               r.service == CBN_SVC_NAS) {
+      // The modem's answer about the network the radio is on.
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      bb_serving.tlv_count = 0;
+      const int read = cbn_read_answer(&bb_serving, sdu, size);
+      if (read) {
+        bb_serving.answered = 1;
+        cbn_take_serving_system(&bb_radio, sdu, size);
+        printf("COACHZ baseband: the serving system answer: error %u, %u TLVs\n", bb_serving.error, bb_serving.tlv_count);
+        bb_radio_log();
+      }
+    } else if (bb_signal_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_signal_slot &&
+               r.service == CBN_SVC_NAS) {
+      // The modem's answer about the signal strength.
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      bb_signal.tlv_count = 0;
+      const int read = cbn_read_answer(&bb_signal, sdu, size);
+      if (read) {
+        bb_signal.answered = 1;
+        cbn_take_signal(&bb_radio, sdu, size);
+        printf("COACHZ baseband: the signal answer: error %u, %u TLVs\n", bb_signal.error, bb_signal.tlv_count);
+        bb_radio_log();
+      }
+    } else if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
       cbe_answer(&bb_esim, static_cast<const uint8_t *>(body), size, bb_now_ms());
     } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
   } else if (r.kind == CBQ_TO_HOST) {
@@ -1223,7 +1565,11 @@ extern "C" void coachz_baseband_poll(void)
   bb_tx batch[16];
   uint32_t n = 0, released[16], r = 0, port;
   IOLockLock(bb_lock);
+  bb_ssctl_step();
+  bb_uim_step();
+  bb_radio_step();
   bb_esim_step();
+  if (bb_lpm_pending == 1) { bb_lpm_pending = 2; bb_lpm_send(); }
   while (bb_tx_count && n < 16) {
     batch[n++] = bb_txq[bb_tx_head];
     bb_tx_head = (bb_tx_head + 1) % BB_TX;
@@ -1231,9 +1577,35 @@ extern "C" void coachz_baseband_poll(void)
   }
   while (r < 16 && (port = cbq_next_release(&bb_qmux))) released[r++] = port;
   IOLockUnlock(bb_lock);
+  /* A send the link refused goes back on the queue: the QRTR layer refuses a DATA packet when the peer is out of
+     credit, and the credit comes back with a RESUME_TX. Dropping the request here would lose it with nothing on
+     the log to say so. The queue is put back under the lock, in order, so the requests keep their order. */
+  uint32_t refused = 0;
   for (uint32_t i = 0; i < n; i++) {
-    bb_send(batch[i].local_port, batch[i].node, batch[i].port, batch[i].data, batch[i].len);
-    IOFreeData(batch[i].data, batch[i].len);
+    if (bb_send(batch[i].local_port, batch[i].node, batch[i].port, batch[i].data, batch[i].len) != 0) {
+      IOLockLock(bb_lock);
+      if (bb_tx_count < BB_TX) {
+        bb_txq[(bb_tx_head + bb_tx_count++) % BB_TX] = batch[i];
+        refused++;
+      } else {
+        IOFreeData(batch[i].data, batch[i].len);
+        bb_tx_dropped++;
+      }
+      IOLockUnlock(bb_lock);
+    } else {
+      IOFreeData(batch[i].data, batch[i].len);
+    }
+  }
+  if (refused) {
+    /* The poll runs as fast as the caller calls it, so a request that the link keeps refusing would print on
+       every pass and fill the log with millions of lines. The refusals are counted and reported with the rest
+       of the bridge's state, once a second, which says the same thing without the flood. */
+    bb_tx_refused += refused;
+    if (bb_now_ms() - bb_refused_last >= 1000u) {
+      bb_refused_last = bb_now_ms();
+      printf("COACHZ baseband: %u QMI requests were refused by the link and are tried again\n", bb_tx_refused);
+      bb_tx_refused = 0;
+    }
   }
   for (uint32_t i = 0; i < r; i++)
     if (bb_del_client) bb_del_client(released[i]);
@@ -1251,7 +1623,38 @@ extern "C" void coachz_baseband_report(unsigned second)
   printf("COACHZ baseband: %u s: %u QMI services, %u clients, dropped %u/%u; sahara state %u, %u executes, %u requests; board calls %u (%u unsupported); data port step %u, %u endpoints named, %u activations\n",
          second, servers, clients, bb_qmux.dropped, bb_tx_dropped, bb_sahara.state, bb_sahara.executes, bb_sahara.requests, bb_control.calls, bb_control.unsupported,
          bb_data.step, bb_endpoint_fixes, bb_activations);
+  /* The services the modem announced, by their QMI service id. The ids are what the client looks the service up by,
+     so a service the modem offered but the bridge never named shows up here as an id nobody asked for. */
+  for (uint32_t i = 0; i < CBQ_MAX_SERVERS; i++) {
+    const struct cbq_server *s = &bb_qmux.server[i];
+    if (!s->present) continue;
+    printf("COACHZ baseband: %u s: the modem offers service 0x%02x, version %u, instance %u, at node %u port %u\n",
+           second, s->service, s->version, s->instance, s->node, s->port);
+  }
   printf("COACHZ qmi: %u s: %u trace lines, %u held back by the budget\n", second, bb_trace_lines, bb_trace_held);
+  /* What the modem says about itself. The failure reason is the modem's own statement of why it stopped,
+     and it is the one thing the log cannot work out on its own. */
+  if (bb_ssctl.answered)
+    printf("COACHZ baseband: %u s: the modem's failure reason: error %u, %u bytes of reason\n", second,
+           bb_ssctl.error, bb_ssctl.reason_len);
+  else if (bb_ssctl.sent)
+    printf("COACHZ baseband: %u s: the modem's failure reason was asked for, no answer yet\n", second);
+  /* The state of the card. */
+  if (bb_uim.answered)
+    printf("COACHZ baseband: %u s: the card's slot status: error %u, %u TLVs\n", second, bb_uim.error, bb_uim.tlv_count);
+  else if (bb_uim.sent)
+    printf("COACHZ baseband: %u s: the card's slot status was asked for, no answer yet\n", second);
+  /* The state of the radio. */
+  if (bb_radio.have_operating_mode || bb_radio.have_serving || bb_radio.have_signal) {
+    printf("COACHZ baseband: %u s: the radio:", second);
+    if (bb_radio.have_operating_mode) printf(" %s", bb_mode_name(bb_radio.operating_mode));
+    if (bb_radio.have_serving) printf(" %s", bb_reg_name(bb_radio.reg_state));
+    if (bb_radio.have_plmn) printf(" on %u-%u", bb_radio.mcc, bb_radio.mnc);
+    if (bb_radio.have_signal) printf(", the signal %d dBm", bb_radio.rssi);
+    printf("\n");
+  } else if (bb_dms.sent || bb_serving.sent || bb_signal.sent) {
+    printf("COACHZ baseband: %u s: the radio was asked for, no answer yet\n", second);
+  }
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) {
     const bb_channel *ch = &bb_ch[c];
     if (ch->opens)

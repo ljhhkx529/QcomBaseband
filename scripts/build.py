@@ -7,8 +7,12 @@ SOURCE = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--tree', type=Path, required=True)
 parser.add_argument('--coachz', action='store_true', help='include the SC7180 IPA v4.2 board adapter')
+parser.add_argument('--fuxi', action='store_true', help='include the fuxi SM8550 board adapter')
+parser.add_argument('--device', type=Path, default=SOURCE.parent.parent.parent / 'unixnu-fuxi',
+                    help='the device repository, whose package/ holds the board headers the fuxi adapter uses')
 args = parser.parse_args()
 tree = args.tree.resolve()
+device = args.device.resolve()
 out = tree / 'build/qcom-baseband'
 out.mkdir(parents=True, exist_ok=True)
 
@@ -19,10 +23,13 @@ def record_for(name):
     return json.loads(matches[0].read_text().strip().rstrip(','))
 
 cpp = record_for('IOPlatformExpert.cpo.json')
-c = record_for('vfs_conf.o.json') if args.coachz else None
+c = record_for('vfs_conf.o.json')
 sources = [(SOURCE / 'baseband/coachz_baseband.cpp', cpp)]
 if args.coachz:
     sources += [(SOURCE / name, c) for name in ('ipa/coachz_ipa_config.c', 'ipa/coachz_gsi.c', 'platform/coachz/coachz_modem.c')]
+if args.fuxi:
+    sources += [(SOURCE / name, c) for name in ('platform/fuxi/qcom_qrtr.c', 'platform/fuxi/fuxi_modem.c',
+                                                   'platform/fuxi/fuxi_ipa.c')]
 objects, report = [], []
 for source, record in sources:
     obj = out / (source.stem + '.o')
@@ -41,7 +48,9 @@ for source, record in sources:
         if value not in ('-MD', '-MP') and not value.startswith('-W'):
             argv.append(value)
         i += 1
-    argv += ['-o', str(obj), '-I', str(SOURCE / 'baseband'), '-I', str(SOURCE / 'ipa'), '-mgeneral-regs-only', '-Wall', '-Wextra']
+    argv += ['-o', str(obj), '-I', str(SOURCE / 'baseband'), '-I', str(SOURCE / 'ipa'), '-I', str(SOURCE / 'platform/fuxi'), '-mgeneral-regs-only', '-Wall', '-Wextra']
+    if args.fuxi:
+        argv += ['-I', str(device / 'package')]
     if str(source) not in argv:
         raise SystemExit('Compile record did not name its source: ' + record['file'])
     result = subprocess.run(argv, cwd=record['directory'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
