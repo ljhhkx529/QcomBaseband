@@ -841,10 +841,9 @@ tx_hold_done:;
     /* The bridge is published once the channel is up. It has to be published after, not before: the bridge's clients
        are bound to the services the modem announces, and it needs this side's send hook to reach them. Until the
        channel is up there is no route to the modem at all, so a bridge published earlier could only fail. */
-    if (link->ready && !link->published) {
-        link->published = 1;
-        fuxi_modem_publish();
-    }
+    /* Safety net: if the early call could not publish (resource service not ready), retry from the
+       poll. A no-op once published. */
+    if (!link->published) fuxi_modem_publish();
     /* The services the bridge wants, asked for by name. The modem does not publish its whole list on its own: it
        answers a lookup with the services that match (Linux net/qrtr/ns.c, ctrl_cmd_new_lookup and lookup_notify),
        and a client that never asks never learns. The lookup is asked for once the modem's node is known, because the
@@ -967,12 +966,24 @@ static void fuxi_bridge_del_client(uint32_t local_port)
     qrtr_send_del_client(&link->qrtr, local_port);
 }
 
-/* The bridge's publish hook, called once the QRTR link is up. The bridge publishes nothing unless
-   /chosen/coachz-baseband says so. */
+/* Publishes the bridge's IOKit services. Called before the modem link exists: CommCenter decides whether
+   to start ABM early in boot and looks the services up once, so they have to be there whatever the modem is
+   doing. QMI requests wait in the bridge's queue (send returns -1) until the channel is up. Idempotent. The
+   bridge publishes nothing unless /chosen/coachz-baseband says so; that check is inside the configure. */
 void fuxi_modem_publish(void)
 {
+    fuxi_modem_link *link = &fuxi_link;
     extern void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t),
                                           void (*del_client)(uint32_t));
+    /* The adapter zeroes the link structure when it takes over (fuxi_modem_start), so the "already published"
+       fact lives here as well: the poll's retry then stays silent instead of publishing a second time. */
+    static int bridge_published;
+    if (bridge_published) {
+        link->published = 1;
+        return;
+    }
+    bridge_published = link->published = 1;
+    printf("FUXI_MODEM: publishing the baseband bridge before the link is up (services only; QMI waits for the channel)\n");
     coachz_baseband_configure(fuxi_bridge_send, fuxi_bridge_del_client);
 }
 
@@ -1182,7 +1193,7 @@ static void fuxi_baseband_node_report(unsigned second)
 {
     if (second != 45u) return;
     DTEntry entry = NULL;
-    void *value = NULL;
+    const void *value = NULL;
     unsigned size = 0;
     /* The root compatible is what libTelephonyUtil's HWModelStr reads: it decides the radio module. */
     {
