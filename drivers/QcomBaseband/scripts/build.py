@@ -28,7 +28,8 @@ sources = [(SOURCE / 'baseband/coachz_baseband.cpp', cpp)]
 if args.coachz:
     sources += [(SOURCE / name, c) for name in ('ipa/coachz_ipa_config.c', 'ipa/coachz_gsi.c', 'platform/coachz/coachz_modem.c')]
 if args.fuxi:
-    sources += [(SOURCE / name, c) for name in ('platform/fuxi/qcom_qrtr.c', 'platform/fuxi/fuxi_modem.c')]
+    sources += [(SOURCE / name, c) for name in ('platform/fuxi/qcom_qrtr.c', 'platform/fuxi/fuxi_modem.c',
+                                                   'platform/fuxi/fuxi_ipa.c')]
 objects, report = [], []
 for source, record in sources:
     obj = out / (source.stem + '.o')

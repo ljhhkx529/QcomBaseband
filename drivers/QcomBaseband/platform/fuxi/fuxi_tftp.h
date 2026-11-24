@@ -96,7 +96,21 @@
 /* The block size this port will actually use: what fits in a packet with room to spare. The modem asks
    for 7680 (measured on 2026-11-22), which is more than a packet holds, so the answer agrees to less and
    the modem takes what the OACK says. */
+/* The largest block a DATA packet can carry. A packet is the QRTR header (32), the block header (4) and the
+   block, so the link's intent (FUXI_IPCRTR_INTENT_SIZE) less 36 is the ceiling; 4000 leaves room and is what the
+   modem accepts.
+ *
+ * 7680 was tried: the modem asks for it and tqftpserv answers it unchanged, but this path sends rather than
+ * queues, and the adapter refused a 7684-byte block mid-window. At 4000 no block was refused. */
 #define FUXI_TFTP_PACKET_BLKSIZE 4000u
+
+/* The window this side agrees to, whatever the modem asks for. TFTP lets the server answer a smaller wsize than
+ * the request named, and this transport needs it: a GLINK channel has a fixed pool of peer intents (30 on this
+ * one) shared with every other packet the port sends, so a window of ten DATA blocks starves after the second
+ * block. Measured: the modem held all 30 of its intents, the port had no room 97 million times, and the transfer
+ * never passed block two. The reference echoes the modem's ten (umi_modem_mhi.inc:785) because its MHI rings are
+ * 32 KiB buffers with no intent accounting (MD_PACKET, :6). */
+#define FUXI_TFTP_WINDOW 1u
 
 /* The prefixes the modem asks its files under, and what each of them maps to in the modem's own volume.
    The reference serves these four (hakios.mpss.c, tftp_file_of:4264-4281) and maps every one of them to
@@ -125,6 +139,16 @@ struct fuxi_tftp_transfer {
 /* The state the protocol half keeps. */
 struct fuxi_tftp_state {
     struct fuxi_tftp_transfer transfer[FUXI_TFTP_TRANSFER_SLOTS];
+    /* The block a read is sent out of: the header and the payload, one of each.
+     *
+     * They live here and not on the kernel's stack. The answer to an acknowledgement is two buffers of
+     * the negotiated block size (4016 and 4000 bytes), and this port's kernel stack is 16 KiB; with the
+     * serving function's own answer buffer the three frames came to 12 KiB and the first acknowledgement
+     * the modem sent after the port was fixed overflowed it. The link reads packets on one thread, so one
+     * buffer in the state is safe; the transfer's own slot is not needed because only one block is built at
+     * a time. */
+    uint8_t block[FUXI_TFTP_PACKET_BLKSIZE + 16u];
+    uint8_t payload[FUXI_TFTP_PACKET_BLKSIZE];
     /* The counters the board's report reads. */
     uint32_t requests;     /* the requests that arrived */
     uint32_t answered;     /* the answers that went out */
@@ -133,6 +157,7 @@ struct fuxi_tftp_state {
     uint32_t refused;      /* the requests that were refused */
     uint32_t missing;      /* the requests for a file that is not there */
     uint32_t blocks_sent;  /* the data blocks that went out */
+    uint32_t sends_failed; /* the blocks the adapter refused to send: the window stops there */
 };
 
 /* Reads one NUL-terminated string out of a packet: the string's bytes and its length. Returns 0 when the
@@ -370,12 +395,12 @@ static inline uint32_t fuxi_tftp_block_length(uint64_t limit, uint32_t blksize, 
 static inline int fuxi_tftp_send_block(struct fuxi_tftp_state *state, struct fuxi_tftp_transfer *t,
                                        const struct fuxi_tftp_ops *ops, void *context, uint32_t block)
 {
-    uint8_t out[FUXI_TFTP_PACKET_BLKSIZE + 16u];
-    uint8_t data[FUXI_TFTP_PACKET_BLKSIZE];
+    uint8_t *out = state->block;
+    uint8_t *data = state->payload;
     const uint32_t n = fuxi_tftp_block_length(t->limit, t->blksize, block);
     if (n && (!ops->read || ops->read(context, t->handle, t->seek + (uint64_t)(block - 1u) * t->blksize, data, n)))
         return -1;
-    const uint32_t length = fuxi_tftp_build_data(out, sizeof out, (uint16_t)block, data, n);
+    const uint32_t length = fuxi_tftp_build_data(out, sizeof state->block, (uint16_t)block, data, n);
     if (!length) return -1;
     if (!ops->send || ops->send(context, FUXI_TFTP_TRANSFER_PORT_BASE + t->slot, t->node, t->port, out, length)) return -1;
     state->blocks_sent++;
@@ -407,7 +432,15 @@ static inline int fuxi_tftp_answer_ack(struct fuxi_tftp_state *state, struct fux
     for (uint32_t block = (uint32_t)acked + 1u; block <= (uint32_t)acked + t->wsize; ++block) {
         if (block > t->blocks) break;
         const int over = fuxi_tftp_send_block(state, t, ops, context, block);
-        if (over < 0) return 0;
+        if (over < 0) {
+            /* The adapter could not take this block right now. The window stops, and the transfer stays: the next
+               acknowledgement from the modem resumes it, which is what tqftpserv does when its send fails
+               (tqftpserv.c:801-804 breaks the loop and the session is kept; only a failed receive closes it,
+               :1006-1008). Telling the caller the window failed instead would drop every block the modem had
+               not yet acknowledged and lose the transfer. */
+            state->sends_failed++;
+            return 1;
+        }
         if (over) break;   /* the short block ended the transfer */
     }
     return 1;
@@ -500,7 +533,9 @@ static inline int fuxi_tftp_serve(struct fuxi_tftp_state *state, uint32_t dst_po
     if (wide_out) *wide_out = r.wide;
     state->requests++;
 
-    uint8_t out[FUXI_TFTP_PACKET_BLKSIZE + 16u];
+    /* Only the options answer, an acknowledgement and an error are built here; the blocks themselves are
+       built in the state's buffers. 512 bytes covers every one of those with room to spare. */
+    uint8_t out[512];
 
     if (r.opcode == FUXI_TFTP_WRQ) {
         /* A write goes into the adapter's memory, under the name the modem used, and the modem can read
@@ -577,6 +612,7 @@ static inline int fuxi_tftp_serve(struct fuxi_tftp_state *state, uint32_t dst_po
     t->port = src_port;
     t->slot = (uint8_t)slot;
     t->blksize = r.blksize;
+    if (r.wsize > FUXI_TFTP_WINDOW) r.wsize = FUXI_TFTP_WINDOW;
     t->wsize = r.wsize;
     t->seek = r.seek;
     t->limit = size > r.seek ? size - r.seek : 0;

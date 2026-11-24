@@ -15,6 +15,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <libkern/c++/OSData.h>
+#include <libkern/c++/OSCollectionIterator.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>
 
@@ -266,6 +267,60 @@ static void bb_queue_tx(uint32_t local_port, uint32_t node, uint32_t port, const
 // HELLO goes out when sahara opens after a SendImage.
 static bool bb_boot_image_sent;
 
+// ------------------------------------------------------------------ operating mode after a boot (bb_lock held)
+// ABM powers the baseband up at every start and the bridge stands for that boot (bb_sahara_restart) while the
+// modem keeps running, so the modem keeps whatever mode it had. A baseband that ABM has just booted comes up in
+// low power: CommCenter logs "Baseband booted in airplane mode", and its subscription switch waits for
+// /cc/props/radio_state to reach Offline, which only the modem's low-power report gives. On the reference board
+// the modem never left the mode CommCenter reads as Shutdown, so the switch never went on and the SIM stayed
+// unknown, with no service. After each such boot the bridge's own DMS client reads the mode and puts the modem
+// in low power (QMI DMS Get/Set Operating Mode 0x002d/0x002e, TLV 0x01 u8: 0 online, 1 low power); CommCenter
+// then takes it online itself. Layouts are libqmi's (qmi-service-dms).
+static const uint32_t BB_DMS = 0x02u, BB_DMS_GET_MODE = 0x002du, BB_DMS_SET_MODE = 0x002eu;
+static uint8_t bb_lpm_pending, bb_lpm_step;
+/* Without ABM nothing opens the sahara channel, so the handshake above would never run and its QMI could not be
+   checked. This runs it once, on the bridge's own first DMS answer, when the boot argument asks for it. */
+static uint8_t bb_lpm_once, bb_lpm_tried;
+static uint32_t bb_lpm_txn = 0x4c00;
+static void bb_lpm_send(void)
+{
+  const struct cbq_server *server = cbq_server_find(&bb_qmux, BB_DMS);
+  if (!server) { if (bb_lpm_step == 0) bb_lpm_pending = 1; return; }   // DMS not announced yet: try again on the next frame
+  if (bb_dms_slot < 0) bb_dms_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, BB_DMS);
+  if (bb_dms_slot < 0) { printf("COACHZ baseband: operating mode: no DMS client\n"); bb_lpm_pending = 0; return; }
+  uint8_t sdu[16];
+  uint32_t n;
+  bb_lpm_txn++;
+  if (bb_lpm_step == 0) {
+    n = cbd_request(sdu, bb_lpm_txn, BB_DMS_GET_MODE, 0);
+  } else {
+    const uint8_t low_power = 1;
+    n = cbd_request(sdu, bb_lpm_txn, BB_DMS_SET_MODE, cbd_tlv(sdu + 7, sizeof sdu - 7u, 0x01, &low_power, 1));
+  }
+  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_dms_slot, server->node, server->port, sdu, n);
+}
+// An answer on the bridge's DMS client: 1 when it was one.
+static int bb_lpm_answer(uint32_t dst_port, const uint8_t *sdu, uint32_t n)
+{
+  if (bb_dms_slot < 0 || dst_port != CBQ_PORT_BASE + (uint32_t)bb_dms_slot) return 0;
+  /* Not our transaction: this client is shared with the radio probe (bb_radio_step), which asks its own question on
+     the same DMS client, so an answer that is not ours has to fall through to that probe. The reference has this
+     client to itself and may swallow anything, which is why its return value here cannot be copied as it stands. */
+  if (n < 7u || sdu[0] != 0x02 || cbd_rd16(sdu + 1) != bb_lpm_txn) return 0;
+  const uint32_t error = cbd_error(sdu, n);
+  if (bb_lpm_step == 0) {
+    uint32_t len = 0;
+    const uint8_t *mode = cbd_find(sdu, n, 0x01, &len);
+    printf("COACHZ baseband: operating mode after the boot: %d (error 0x%x), setting low power\n",
+           mode && len >= 1 ? (int)mode[0] : -1, error);
+    bb_lpm_step = 1;
+    bb_lpm_send();
+  } else {
+    printf("COACHZ baseband: operating mode set to low power: error 0x%x\n", error);
+    bb_lpm_pending = 0;
+  }
+  return 1;
+}
 static void bb_sahara_restart(void)
 {
   struct cbs_out o;
@@ -273,6 +328,8 @@ static void bb_sahara_restart(void)
   cbs_init(&bb_sahara, bb_sahara_images, sizeof bb_sahara_images / sizeof bb_sahara_images[0], 0x10000);
   cbs_start(&bb_sahara, &o);
   for (uint32_t i = 0; i < o.count; i++) bb_push(CBH_SAHARA, o.data[i], o.len[i]);
+  bb_lpm_pending = 1;
+  bb_lpm_step = 0;
   printf("COACHZ baseband: sahara hello\n");
 }
 
@@ -854,6 +911,15 @@ static void bb_reply(IOExternalMethodArguments *args, IOReturn result, uint32_t 
 }
 
 // ------------------------------------------------------------------ AppleBasebandPCIInterface
+/* Which service ABM opens, and with which client type: the board-class open and the PCI control open say
+ * different things about how far the baseband stack came, and a channel open that never happens is the
+ * difference between "ABM never touched it" and "ABM stopped after the board class". */
+static void bb_note_open(const char *name, UInt32 type, uint32_t *seen)
+{
+  const uint32_t n = __atomic_fetch_add(seen, 1u, __ATOMIC_RELAXED);
+  if (n < 4) printf("COACHZ baseband: %s user client %u, type %u\n", name, n + 1, (unsigned)type);
+}
+
 class AppleBasebandPCIUserClient : public IOUserClient {
   OSDeclareDefaultStructors(AppleBasebandPCIUserClient)
   task_t fTask;
@@ -1099,7 +1165,7 @@ public:
     *out = nullptr;
     static uint32_t seen;
     if (!(__atomic_fetch_or(&seen, 1u << fChannel, __ATOMIC_RELAXED) & (1u << fChannel)))
-      printf("COACHZ baseband: first user client on %s\n", cbh_published[fChannel]);
+      printf("COACHZ baseband: first user client on %s, type %u\n", cbh_published[fChannel], (unsigned)type);
     AppleBasebandPCIUserClient *client = OSTypeAlloc(AppleBasebandPCIUserClient);
     if (!client) return kIOReturnNoMemory;
     client->setChannel(fChannel);
@@ -1191,7 +1257,7 @@ public:
   IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
   {
     static uint32_t seen;
-    if (!__atomic_exchange_n(&seen, 1, __ATOMIC_RELAXED)) printf("COACHZ baseband: first user client on AppleBasebandPCIControl\n");
+    bb_note_open("AppleBasebandPCIControl", type, &seen);
     return bb_open<AppleBasebandPCIControlUserClient>(this, t, s, type, p, out);
   }
   IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
@@ -1233,6 +1299,10 @@ class AppleBaseband : public IOService {
 public:
   IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
   {
+    /* The one open that told us nothing until now: the PCI control and every channel print, this did not, so a log
+       without it could not tell "ABM never touched the baseband" from "ABM opened it and stopped". */
+    static uint32_t seen;
+    bb_note_open("AppleBaseband", type, &seen);
     return bb_open<AppleBasebandUserClient>(this, t, s, type, p, out);
   }
   IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
@@ -1286,6 +1356,8 @@ class AppleIPAppender : public IOService {
 public:
   IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
   {
+    static uint32_t seen;
+    bb_note_open("AppleIPAppender", type, &seen);
     return bb_open<AppleIPAppenderUserClient>(this, t, s, type, p, out);
   }
   IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
@@ -1309,11 +1381,29 @@ class AppleBasebandPCIMAVPDPManager : public AppleBasebandPCIPDPManager {
 OSDefineMetaClassAndStructors(AppleBasebandPCIMAVPDPManager, AppleBasebandPCIPDPManager)
 
 // ------------------------------------------------------------------ publication and the Wi-Fi thread's entry points
+/* `node`: a device-tree node whose name and properties the service takes, the way a DT-backed nub would.
+ * libTelephonyBaseband finds the board with IOServiceNameMatching("baseband") and reads its "config"
+ * (_TelephonyBasebandControllerLoadConfigOnce), so a service published without the node's name and properties
+ * is invisible to the baseband manager: ABM never opens it. Same publication the reference implementation uses. */
 template <class Service>
-static Service *bb_publish(IOService *provider, uint32_t channel = ~0u)
+static Service *bb_publish(IOService *provider, uint32_t channel = ~0u, const char *node = nullptr)
 {
   Service *service = OSTypeAlloc(Service);
   bool ok = service && service->init();
+  if (ok && node) {
+    IORegistryEntry *dt = IORegistryEntry::fromPath(node, gIODTPlane);
+    OSDictionary *props = dt ? dt->dictionaryWithProperties() : nullptr;
+    OSCollectionIterator *keys = props ? OSCollectionIterator::withCollection(props) : nullptr;
+    while (OSSymbol *key = keys ? OSDynamicCast(OSSymbol, keys->getNextObject()) : nullptr)
+      service->setProperty(key, props->getObject(key));
+    service->setName(dt ? dt->getName() : "baseband");
+    printf("COACHZ baseband: %s took %u properties from IODeviceTree:%s (config %s), name %s\n",
+           service->getMetaClass()->getClassName(), props ? props->getCount() : 0u, node,
+           props && props->getObject("config") ? "present" : "MISSING", service->getName());
+    OSSafeReleaseNULL(keys);
+    OSSafeReleaseNULL(props);
+    OSSafeReleaseNULL(dt);
+  }
   if (ok && channel != ~0u) {
     AppleBasebandPCIInterface *interface = OSDynamicCast(AppleBasebandPCIInterface, service);
     ok = interface && interface->setup(channel);
@@ -1339,9 +1429,13 @@ extern "C" void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32
   bb_pdp_init();
   bb_send = send;
   bb_del_client = del_client;
+  {
+    uint32_t once = 0;
+    if (PE_parse_boot_argn("sheng-bb-lpm", &once, sizeof once) && once) bb_lpm_once = 1;
+  }
   IOService *provider = IOService::getResourceService();
   int made = 0;
-  made += provider && bb_publish<AppleBaseband>(provider);
+  made += provider && bb_publish<AppleBaseband>(provider, ~0u, "/baseband");
   made += provider && bb_publish<AppleBasebandPCIControl>(provider);
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) made += provider && bb_publish<AppleBasebandPCIInterface>(provider, c);
   made += provider && bb_publish<AppleBasebandPCIMAVPDPManager>(provider);
@@ -1395,6 +1489,8 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
       bb_uim.tlv_count = 0;
       const int read = cbp_read_answer(&bb_uim, sdu, size);
       if (read) { bb_uim.answered = 1; bb_uim_log(sdu, size); }
+    } else if (bb_dms_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_dms_slot && bb_lpm_answer(dst_port, static_cast<const uint8_t *>(body), size)) {
+      /* The low-power handshake above owns this client while it runs. */
     } else if (bb_dms_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_dms_slot &&
                r.service == CBN_SVC_DMS) {
       // The modem's answer about the radio's power state.
@@ -1406,6 +1502,12 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
         cbn_take_operating_mode(&bb_radio, sdu, size);
         printf("COACHZ baseband: the DMS answer: error %u, %u TLVs\n", bb_dms.error, bb_dms.tlv_count);
         bb_radio_log();
+        if (bb_lpm_once && !bb_lpm_tried) {
+          bb_lpm_tried = 1;
+          printf("COACHZ baseband: exercising the boot operating-mode handshake (no ABM is driving the baseband)\n");
+          bb_lpm_pending = 1;
+          bb_lpm_step = 0;
+        }
       }
     } else if (bb_serving_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_serving_slot &&
                r.service == CBN_SVC_NAS) {
@@ -1467,6 +1569,7 @@ extern "C" void coachz_baseband_poll(void)
   bb_uim_step();
   bb_radio_step();
   bb_esim_step();
+  if (bb_lpm_pending == 1) { bb_lpm_pending = 2; bb_lpm_send(); }
   while (bb_tx_count && n < 16) {
     batch[n++] = bb_txq[bb_tx_head];
     bb_tx_head = (bb_tx_head + 1) % BB_TX;

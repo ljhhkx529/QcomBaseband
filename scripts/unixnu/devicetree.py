@@ -375,13 +375,19 @@ def generate(dtb, config, *, unique_chip_id=None, data=False, trust=False, addon
     children.append(node('arm-io', [('device_type', b'arm-io\0'), ('#address-cells', struct.pack('<I', 2)),
                          ('#size-cells', struct.pack('<I', 2)), ('ranges', struct.pack('<QQQ', 0, base, size))],
                          [node(name, hardware_properties(entry, handles, base)) for name, entry in zip(names, hardware)]))
-    for name in ('defaults', 'options', 'product', 'buttons'):
+    for name in ('defaults', 'options', 'product', 'buttons', 'baseband'):
         if name in platform or name in ('defaults', 'options', 'product'):
             children.append(platform_node(name, platform.get(name, {})))
-    # A configured root 'compatible' goes before the hardware DTS's own entries: an OS identity's board name comes first (the OS
-    # reads the first entry as the hardware model) and the board's compatible strings stay matchable after it.
+    # A configured root 'compatible' goes before the hardware DTS's own entries by default: an OS identity's board name comes
+    # first (the OS reads the first entry as the hardware model) and the board's compatible strings stay matchable after it.
+    # adt.replace-root-compatible = true keeps only the configured string, which is the shape the cellular reference uses:
+    # HWModelStr reads the whole property, so a trailing board string can make the model lookup fail.
     configured = dict(typed_properties(platform.get('root', {})))
-    compatible = configured.pop('compatible', b'') + root.properties['compatible']
+    configured_compatible = configured.pop('compatible', b'')
+    if platform.get('replace-root-compatible', False):
+        compatible = configured_compatible
+    else:
+        compatible = configured_compatible + root.properties['compatible']
     root_properties = [('compatible', compatible), ('#address-cells', struct.pack('<I', 2)),
                        ('#size-cells', struct.pack('<I', 2)), *configured.items()]
     if not any(key == 'model' for key, _ in root_properties):

@@ -18,12 +18,19 @@
 #include <sys/errno.h>
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
+#include <sys/proc_internal.h>
+#include <pexpert/device_tree.h>
+#include <sys/fcntl.h>
+#include <sys/uio.h>
+#include <sys/vnode.h>
 
 #include "qcom_qrtr.h"
 
 #include "fuxi_servreg.h"
 #include "fuxi_rmtfs.h"
 #include "fuxi_tftp.h"
+#include "fuxi_ipa.h"
+#include "coachz_ipa_qmi.h"
 
 #include "QcomGlink.h"
 #include "QcomSmem.h"
@@ -40,14 +47,33 @@
 /* The channel the modem opens for IPCRTR, and the intent it grants on it. Linux matches the rpmsg device by the
    name the remote opens the channel with (net/qrtr/smd.c matches "IPCRTR"). */
 #define FUXI_IPCRTR_CHANNEL "IPCRTR"
-/* The modem's IPCRTR intents are 4 KiB on this class of SoC; Linux asks for what the remote offers and this is the
-   size the fuxi's modem grants. It is a bound, not a proof: a smaller grant is handled by the intent handshake. */
+/* The intent this side offers for IPCRTR, and so the largest packet either side may put on the channel.
+ *
+ * 4096, and the measurement is what keeps it here: with 8192 the port answered the modem's blksize 7680 with a
+ * 7684-byte DATA packet, and the third block of the window was refused by the adapter (the per-second report
+ * counts it: 1 block the adapter would not send) while the same run at 4036-byte packets had none. tqftpserv
+ * answers 7680 too, but it sends through a Linux QRTR socket, which queues and applies flow control instead of
+ * failing the send. */
 #define FUXI_IPCRTR_INTENT_SIZE 4096u
 #define FUXI_IPCRTR_INTENT_COUNT 8u
 
 /* The QRTR node the AP claims. Linux leaves it to the endpoint registration (QRTR_EP_NID_AUTO) but its local node id
    is 1 and the Trogdor reference port uses the same; the modem addresses the AP by it. */
 #define FUXI_QRTR_LOCAL_NODE QRTR_LOCAL_NODE
+
+/* The IPA's host service: the fourth service the reference publishes beside RMTFS, TFTP and the locator
+   (hakios.mpss.c:4016-4018: service 0x31, instance word 0x101). The modem's IPA driver agrees on the IPA's
+   shared memory with this service before it uses the IPA: the AP hosts 0x31 version 1 instance 1, the modem
+   registers for an indication here (0x20) and says when its driver is up (0x35), and the AP asks the modem's
+   own 0x31 instance 2 to initialize (0x21) before it says all is complete (0x22).
+   Without that handshake the modem's LTE downlink task dies on a null pointer the moment it goes online
+   (enl2_dl), which the reference records three times out of three.
+   The port is 0x4005: 0x4001-0x4004 carry the locator, RMTFS and the two TFTP versions, and 0x4010-0x4013 the
+   TFTP transfers. */
+#define FUXI_IPA_HOST_SERVICE  0x31u
+#define FUXI_IPA_HOST_VERSION  1u
+#define FUXI_IPA_HOST_INSTANCE 1u
+#define FUXI_IPA_HOST_PORT     0x4005u
 
 /* How many milliseconds pass between the wildcard service lookups. A service the modem registers later is only
    found by asking again, because the name service does not announce what appears later. */
@@ -146,6 +172,16 @@ typedef struct {
     QcomGlink glink;
     QcomGlinkChannel *channel;
     struct qrtr_state qrtr;
+    /* The packet the link could not take: the remote had no intent big enough for it and has been asked for
+       one (QcomGlink.c:510-526 returns QcomGlinkAgain, not an error). The packet is kept and offered again on
+       every poll, which runs far more often than the modem's own five-second timeout, so the transfer resumes
+       instead of waiting for a retransmission. Only the first one is kept: a later packet of the same window is
+       derived again from the acknowledgement the modem sends. */
+    uint8_t tx_hold[QRTR_MAX_PACKET];
+    uint32_t tx_hold_length;
+    uint8_t tx_hold_valid;
+    uint32_t tx_hold_at;          /* when the hold was last offered, in milliseconds */
+    uint32_t tx_retried, tx_resumed;
     /* The counters the report shows. */
     uint32_t rx_packets, tx_packets, tx_again, open_failures;
     char last_error[96];
@@ -186,6 +222,11 @@ typedef struct {
     struct fuxi_tftp_state tftp;
     uint8_t tftp_announced;
     uint32_t tftp_announces, tftp_hello_at;
+    /* The IPA's windows, mapped once when the link comes up. Read only: no register is touched. */
+    struct fuxi_ipa_windows ipa;
+    /* The IPA's host service: announced like the other three, and what the modem has asked of it. */
+    uint8_t ipa_host_announced;
+    uint32_t ipa_host_announces, ipa_host_hello_at, ipa_host_requests, ipa_host_answered;
     /* The board's adapter: it opens the modem's files and reads them out. */
     struct fuxi_tftp_ops tftp_ops;
     void *tftp_context;
@@ -216,8 +257,15 @@ static int fuxi_qrtr_send(void *context, uint32_t src_port, uint32_t dst_node, u
     if (!link->channel) return -1;
     const int result = qcom_glink_send(&link->glink, link->channel, data, length);
     if (result == QcomGlinkAgain) {
-        /* No remote intent yet: the owner asks again on the next event. */
+        /* No remote intent big enough yet; the link asked the modem for one. Keeping the packet lets the retry
+           land the moment the intent arrives instead of waiting for the modem to time the transfer out. */
         link->tx_again++;
+        if (!link->tx_hold_valid && length <= sizeof link->tx_hold) {
+            memcpy(link->tx_hold, data, length);
+            link->tx_hold_length = length;
+            link->tx_hold_valid = 1;
+            link->tx_hold_at = fuxi_modem_now_ms();
+        }
         return -1;
     }
     if (result != QcomGlinkOk) {
@@ -254,6 +302,8 @@ static void fuxi_qrtr_lookup(void *context, uint32_t service, uint32_t version_i
            firmware expects, and the reference publishes both. */
         {FUXI_TFTP_SERVICE, FUXI_TFTP_VERSION, FUXI_TFTP_INSTANCE, FUXI_TFTP_PORT},
         {FUXI_TFTP_SERVICE, FUXI_TFTP_VERSION_ALT, FUXI_TFTP_INSTANCE, FUXI_TFTP_PORT_ALT},
+        /* The IPA's host service, for the modem that looks it up rather than reads the announcement. */
+        {FUXI_IPA_HOST_SERVICE, FUXI_IPA_HOST_VERSION, FUXI_IPA_HOST_INSTANCE, FUXI_IPA_HOST_PORT},
     };
     /* The instance word: the version in the low byte, the instance in the high one. */
     const uint32_t wanted_instance = version_instance >> 8;
@@ -301,6 +351,32 @@ static void fuxi_qrtr_data(void *context, uint32_t dst_port, uint32_t src_node, 
         (dst_port >= FUXI_TFTP_TRANSFER_PORT_BASE &&
          dst_port < FUXI_TFTP_TRANSFER_PORT_BASE + FUXI_TFTP_TRANSFER_SLOTS)) {
         fuxi_tftp_receive(link, dst_port, src_node, src_port, body, length);
+        return;
+    }
+    /* The IPA's host service. It is announced so the modem starts its side of the IPA handshake; nothing is
+       answered yet, and the message id is logged so the call is on the record before the handshake is written.
+       Linux's ipa_qmi.c expects 0x20 (indication register) and 0x35 (driver init complete) here. */
+    if (dst_port == FUXI_IPA_HOST_PORT) {
+        const uint8_t *m = (const uint8_t *)body;
+        const uint32_t message = length >= 7u ? (uint32_t)m[3] | (uint32_t)m[4] << 8 : 0u;
+        link->ipa_host_requests++;
+        struct ci_msg qmi;
+        printf("FUXI_MODEM: the ipa host service was asked message 0x%04x, %u bytes\n", message, length);
+        /* The two messages the modem sends here are answered with a result and nothing else: it registers for
+           the indications (0x20) and says its driver is up (0x35). Linux's ipa_qmi.c answers both the same way
+           (ipa_server_indication_register, ipa_server_driver_init_complete).
+           The third step of the handshake, the AP asking the modem's own 0x31 instance 2 to initialise with
+           0x21, cannot be sent yet: its request carries the addresses of the tables inside the IPA's local
+           memory, and that memory is not mapped on this port. */
+        if (length >= 7u && ci_parse((const uint8_t *)body, length, &qmi) &&
+            (message == CI_INDICATION_REGISTER || message == CI_DRIVER_INIT_COMPLETE)) {
+            uint8_t answer[32];
+            const size_t n = ci_success_rsp(answer, sizeof answer, qmi.txn, (uint16_t)message);
+            if (n && !qrtr_send_data(&link->qrtr, FUXI_IPA_HOST_PORT, src_node, src_port, answer, (uint32_t)n)) {
+                link->ipa_host_answered++;
+                printf("FUXI_MODEM: the ipa host answered 0x%04x with a success result\n", message);
+            }
+        }
         return;
     }
     extern int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t src_port, const void *body, uint32_t size);
@@ -500,7 +576,15 @@ static void fuxi_tftp_receive(fuxi_modem_link *link, uint32_t dst_port, uint32_t
     const int served = fuxi_tftp_serve(&link->tftp, dst_port, src_node, src_port, (const uint8_t *)body, length,
                                         &link->tftp_ops, link, &opcode, &wide);
     if (!served) {
-        printf("FUXI_MODEM: the tftp was sent %u bytes it cannot answer\n", length);
+        /* Nothing to do with it. A transport port takes a block or an acknowledgement that belongs to a live
+           transfer, and an acknowledgement that arrives after its transfer is over is the normal end of a read:
+           tqftpserv closes the session when the acknowledgement has already covered rsize and silently drops
+           whatever comes next (tqftpserv.c:789 and :1007), and its "End of Transfer" error is logged as an
+           ordinary event and not as a fault (tqftpserv.c:773). The port and the opcode are on the line so a
+           dropped packet can be told from a refused one without rebuilding. */
+        printf("FUXI_MODEM: the tftp: nothing waits for %u bytes on port %u (first bytes", length, dst_port);
+        for (uint32_t i = 0; i < length && i < 8u; ++i) printf(" %02x", ((const uint8_t *)body)[i]);
+        printf(")\n");
         return;
     }
     const char *name = "unknown";
@@ -514,9 +598,11 @@ static void fuxi_tftp_receive(fuxi_modem_link *link, uint32_t dst_port, uint32_t
     }
     printf("FUXI_MODEM: the tftp: the modem asks %s (opcode %u%s), %u bytes, on port %u\n", name, opcode,
            wide ? ", the wide shape" : "", length, dst_port);
-    /* The request's own bytes, so the path it names is on the log. */
+    /* The request's own bytes, so the path it names and the options it carries are on the log. The whole
+       request is printed: a TFTP request puts its options after the path, so a dump that stops at 96 bytes
+       hides wsize, rsize, seek and tsize, which are exactly what a transfer has to be answered with. */
     printf("FUXI_MODEM: the tftp: the request is %u bytes:", length);
-    for (uint32_t i = 0; i < length && i < 96u; ++i) printf(" %02x", ((const uint8_t *)body)[i]);
+    for (uint32_t i = 0; i < length; ++i) printf(" %02x", ((const uint8_t *)body)[i]);
     printf("\n");
 }
 
@@ -566,7 +652,7 @@ static void fuxi_trace_qrtr_tx(void *context, const uint8_t *bytes, uint32_t cou
 {
     (void)context;
     printf("FUXI_MODEM: the qrtr packet we sent is %u bytes:", count);
-    for (uint32_t i = 0; i < count && i < 64; ++i) printf(" %02x", bytes[i]);
+    for (uint32_t i = 0; i < count; ++i) printf(" %02x", bytes[i]);
     printf("\n");
 }
 
@@ -662,11 +748,46 @@ int fuxi_modem_start(const fuxi_modem_link_config *config)
 }
 
 /* The owner's poll: runs the GLINK, then answers what the modem asked for. */
+/* Announces the IPA's host service, the same way the other three are announced and for the same reason. */
+static int fuxi_announce_ipa_host(fuxi_modem_link *link, uint32_t node)
+{
+    if (qrtr_send_new_server(&link->qrtr, node, FUXI_IPA_HOST_SERVICE, FUXI_IPA_HOST_VERSION,
+                             FUXI_IPA_HOST_INSTANCE, FUXI_IPA_HOST_PORT)) {
+        snprintf(link->last_error, sizeof link->last_error, "the ipa host announcement was refused");
+        return -1;
+    }
+    link->ipa_host_announces++;
+    link->ipa_host_hello_at = link->qrtr.hellos;
+    printf("FUXI_MODEM: the ipa host was announced: service 0x%02x version %u instance %u, on port %u, to node %u\n",
+           FUXI_IPA_HOST_SERVICE, FUXI_IPA_HOST_VERSION, FUXI_IPA_HOST_INSTANCE, FUXI_IPA_HOST_PORT, node);
+    return 0;
+}
+
 void fuxi_modem_poll(void)
 {
     fuxi_modem_link *link = &fuxi_link;
     if (!link->channel) return;
     qcom_glink_poll(&link->glink);
+    /* The IPA's windows, mapped once the link is up: the addresses are the device tree's, and mapping them is the
+       step that has to come before the handshake's INIT_DRIVER can carry anything real. */
+    if (link->ready && !link->ipa.mapped) fuxi_ipa_map(&link->ipa);
+    /* The packet the link could not take when it had no room for it. */
+    if (link->tx_hold_valid && link->channel) {
+        /* Offered ten times a second and not on every poll: the poll runs on the order of hundreds of thousands of
+           times a second when the poller is idle, and the first version of this retry counted 97 million attempts
+           in ten minutes while the modem held every intent. */
+        const uint32_t held_now = fuxi_modem_now_ms();
+        if ((uint32_t)(held_now - link->tx_hold_at) < 100u) goto tx_hold_done;
+        link->tx_hold_at = held_now;
+        link->tx_retried++;
+        const int again = qcom_glink_send(&link->glink, link->channel, link->tx_hold, link->tx_hold_length);
+        if (again == QcomGlinkOk) {
+            link->tx_hold_valid = 0;
+            link->tx_packets++;
+            link->tx_resumed++;
+        }
+    }
+tx_hold_done:;
     /* The HELLO waits here: by the time the channel is up there is somewhere to send it. */
     if (link->hello_pending && link->ready) fuxi_send_hello();
     /* The answer to the modem's HELLO is owed until the link has room for it: the remote's receive intent is still
@@ -707,6 +828,14 @@ void fuxi_modem_poll(void)
             if (fuxi_announce_tftp(link, link->qrtr.remote_node) == 0) link->tftp_announced = 1;
         } else if (link->qrtr.hellos > link->tftp_hello_at) {
             fuxi_announce_tftp(link, link->qrtr.remote_node);
+        }
+    }
+    /* The IPA's host service, announced the same way: the modem learns of it only from the announcement. */
+    if (link->ready && link->qrtr.remote_node_known) {
+        if (!link->ipa_host_announced) {
+            if (fuxi_announce_ipa_host(link, link->qrtr.remote_node) == 0) link->ipa_host_announced = 1;
+        } else if (link->qrtr.hellos > link->ipa_host_hello_at) {
+            fuxi_announce_ipa_host(link, link->qrtr.remote_node);
         }
     }
     /* The bridge is published once the channel is up. It has to be published after, not before: the bridge's clients
@@ -939,14 +1068,163 @@ void fuxi_modem_status(fuxi_modem_link_status *status)
 }
 
 /* What the link has seen, for the periodic report. */
+
+/* Whether iOS's own CommCenter is running. Everything the Settings app shows on the cellular side — the entry
+ * itself, the SIM state, the IMEI — is CommCenter's, so a Settings with none of the three says CommCenter is not
+ * there. The bridge publishes its services whether or not anything uses them, so "published" alone cannot tell
+ * those two apart. This reads the process list once at 30 seconds and once at 120. */
+static void fuxi_commcenter_report(unsigned second)
+{
+    if (second != 30u && second != 120u) return;
+    pid_t found = 0, logger = 0, launchd = 0, abm = 0, helper = 0;
+    proc_list_lock();
+    struct proc *p;
+    LIST_FOREACH(p, &allproc, p_list) {
+        if (!found && strncmp(p->p_comm, "CommCenter", sizeof p->p_comm) == 0) found = p->p_pid;
+        if (!logger && strncmp(p->p_comm, "logd", sizeof p->p_comm) == 0) logger = p->p_pid;
+        if (!launchd && strncmp(p->p_comm, "launchd", sizeof p->p_comm) == 0) launchd = p->p_pid;
+        if (!abm && strncmp(p->p_comm, "abm-helper", sizeof p->p_comm) == 0) abm = p->p_pid;
+        if (!helper && strncmp(p->p_comm, "CommCenterRoot", sizeof p->p_comm) == 0) helper = p->p_pid;
+    }
+    proc_list_unlock();
+    printf("FUXI_MODEM: CommCenter is %s at %u s (pid %d); logd %s (pid %d); launchd %s (pid %d); abm-helper %s (pid %d); CommCenterRootHelper %s (pid %d)\n",
+           found ? "running" : "NOT running", second, found,
+           logger ? "running" : "NOT running", logger, launchd ? "running" : "NOT running", launchd,
+           abm ? "running" : "NOT running", abm, helper ? "running" : "NOT running", helper);
+}
+
+/* The file our launchd job writes. Its presence answers the question the console could not: whether the job ran
+ * at all. The kernel may read the Data volume with the same interface its writes already use. */
+static void fuxi_logdump_read(unsigned second)
+{
+    if (second != 150u && second != 210u) return;
+    int enabled = 0;
+    extern int PE_parse_boot_argn(const char *, void *, int);
+    if (!PE_parse_boot_argn("sheng-logdump", &enabled, sizeof enabled) || !enabled) return;
+    vnode_t vp = NULLVP;
+    vfs_context_t ctx = vfs_context_current();
+    const int opened = vnode_open("/private/var/db/fuxi-logdump.txt", FREAD | O_NOFOLLOW, 0, 0, &vp, ctx);
+    if (opened) {
+        printf("FUXI_LOGDUMP: no file at %u s (%d): the job did not run\n", second, opened);
+        return;
+    }
+    /* One buffer for every file this hook reads: three of them on the kernel stack overflowed it. */
+    static char buffer[4096];
+    uint64_t at = 0;
+    unsigned total = 0;
+    while (total < 24000u) {
+        int resid = 0;
+        const int error = vn_rdwr(UIO_READ, vp, buffer, sizeof buffer - 1u, at, UIO_SYSSPACE, 0,
+                                  vfs_context_ucred(ctx), &resid, NULL);
+        const int got = (int)(sizeof buffer - 1u) - resid;
+        if (got <= 0) break;
+        buffer[got] = 0;
+        printf("FUXI_LOGDUMP %u s: %s", second, buffer);
+        at += (uint64_t)got;
+        total += (unsigned)got;
+        if (error || resid) break;
+    }
+    vnode_close(vp, FREAD, ctx);
+    if (!total) printf("FUXI_LOGDUMP: the file is empty at %u s\n", second);
+    /* What the two jobs themselves printed: their StandardErrorPath points here. */
+    {
+        static const char *const logs[] = {"/private/var/db/commcenter.log", "/private/var/db/abm-helper.log",
+                                           "/private/var/db/abm.log"};
+        static const char *const tags[] = {"FUXI_CC", "FUXI_ABM", "FUXI_ABMJOB"};
+        for (unsigned pass = 0; pass < sizeof logs / sizeof logs[0]; ++pass) {
+            vnode_t vp2 = NULLVP;
+            const int opened2 = vnode_open(logs[pass], FREAD | O_NOFOLLOW, 0, 0, &vp2, ctx);
+            if (opened2) { printf("FUXI_LOGDUMP: no %s at %u s (%d)\n", logs[pass], second, opened2); continue; }
+            uint64_t at2 = 0;
+            unsigned total2 = 0;
+            while (total2 < 12000u) {
+                int resid2 = 0;
+                const int error2 = vn_rdwr(UIO_READ, vp2, buffer, sizeof buffer - 1u, at2, UIO_SYSSPACE, 0,
+                                           vfs_context_ucred(ctx), &resid2, NULL);
+                const int got2 = (int)(sizeof buffer - 1u) - resid2;
+                if (got2 <= 0) break;
+                buffer[got2] = 0;
+                printf("%s %u s: %s", tags[pass], second, buffer);
+                at2 += (uint64_t)got2;
+                total2 += (unsigned)got2;
+                if (error2 || resid2) break;
+            }
+            vnode_close(vp2, FREAD, ctx);
+            if (!total2) printf("FUXI_LOGDUMP: %s wrote nothing at %u s\n", logs[pass], second);
+        }
+    }
+    {
+        vnode_t vp3 = NULLVP;
+        if (vnode_open("/private/var/db/abmlite.log", FREAD | O_NOFOLLOW, 0, 0, &vp3, ctx) == 0) {
+            int resid3 = 0;
+            const int got3 = (int)sizeof buffer - 1;
+            if (vn_rdwr(UIO_READ, vp3, buffer, got3, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid3, NULL) == 0) {
+                const int n3 = got3 - resid3;
+                if (n3 > 0) { buffer[n3] = 0; printf("FUXI_ABMLITE %u s: %s", second, buffer); }
+            }
+            vnode_close(vp3, FREAD, ctx);
+        } else {
+            printf("FUXI_LOGDUMP: abmlite wrote nothing at %u s\n", second);
+        }
+    }
+    /* The firmware our own job unpacked on Data, seen through the union over /usr/standalone/firmware. */
+    {
+        vnode_t fw = NULLVP;
+        const int found = vnode_lookup("/usr/standalone/firmware/Baseband/Mav16/Info.plist", 0, &fw, vfs_context_current());
+        if (found == 0) { vnode_put(fw); printf("FUXI_LOGDUMP: the firmware is visible through the union at %u s\n", second); }
+        else printf("FUXI_LOGDUMP: the firmware is not visible through the union at %u s (%d)\n", second, found);
+    }
+}
+
+
+/* Whether the node launchd selects the cellular CommCenter job by is in the device tree the kernel runs with. */
+static void fuxi_baseband_node_report(unsigned second)
+{
+    if (second != 45u) return;
+    DTEntry entry = NULL;
+    void *value = NULL;
+    unsigned size = 0;
+    /* The root compatible is what libTelephonyUtil's HWModelStr reads: it decides the radio module. */
+    {
+        DTEntry root = NULL;
+        const void *compat = NULL;
+        unsigned length = 0;
+        if (SecureDTLookupEntry(NULL, "/", &root) == kSuccess &&
+            SecureDTGetProperty(root, "compatible", &compat, &length) == kSuccess && compat) {
+            printf("FUXI_DT: root compatible = %s (%u bytes)\n", (const char *)compat, length);
+        } else {
+            printf("FUXI_DT: the root has no compatible\n");
+        }
+    }
+    if (SecureDTLookupEntry(NULL, "/baseband", &entry) != kSuccess) {
+        printf("FUXI_DT: /baseband is NOT in the device tree\n");
+        return;
+    }
+    if (SecureDTGetProperty(entry, "compatible", &value, &size) == kSuccess && value && size) {
+        printf("FUXI_DT: /baseband compatible = %s (%u bytes)\n", (const char *)value, size);
+    } else {
+        printf("FUXI_DT: /baseband is there, with no compatible\n");
+    }
+}
+
 void fuxi_modem_report(unsigned second)
 {
     fuxi_modem_link *link = &fuxi_link;
     extern void coachz_baseband_report(unsigned second);
     coachz_baseband_report(second);
-    printf("FUXI modem: %u s: link %s, QRTR tx %u rx %u again %u, servers %u, glink tx %u rx %u\n", second,
+    fuxi_commcenter_report(second);
+    fuxi_logdump_read(second);
+    fuxi_baseband_node_report(second);
+    /* The modem's writes to its four files land in the copy in memory; this carries them to the Data volume once a
+       second. Nothing is written when the modem has not written. */
+    {
+        extern void fuxi_rmtfs_flush(void);
+        fuxi_rmtfs_flush();
+    }
+    printf("FUXI modem: %u s: link %s, QRTR tx %u rx %u again %u, servers %u, glink tx %u rx %u, "
+           "held packets retried %u and sent %u\n", second,
            link->ready ? "up" : "down", link->tx_packets, link->rx_packets, link->tx_again, link->qrtr.servers,
-           link->glink.tx_messages, link->glink.rx_messages);
+           link->glink.tx_messages, link->glink.rx_messages, link->tx_retried, link->tx_resumed);
     /* The locator's own counts: how often it was announced, and what the modem asked of it. */
     printf("FUXI modem: %u s: the locator was announced %u times, took %u requests and answered %u\n", second,
            link->locator_announces, link->locator_requests, link->locator_answered);
@@ -956,9 +1234,11 @@ void fuxi_modem_report(unsigned second)
     /* TFTP's own counts: a request count that stays at zero says the modem never asked for its carrier
        configuration, which is the gate this service is behind. */
     printf("FUXI modem: %u s: the tftp was announced %u times, took %u requests and answered %u, read %u blocks, "
-           "wrote %u, missed %u\n",
+           "wrote %u, missed %u, %u blocks the adapter would not send\n",
            second, link->tftp_announces, link->tftp.requests, link->tftp.answered, link->tftp.reads,
-           link->tftp.writes, link->tftp.missing);
+           link->tftp.writes, link->tftp.missing, link->tftp.sends_failed);
+    printf("FUXI modem: %u s: the ipa host was announced %u times and asked %u\n", second,
+           link->ipa_host_announces, link->ipa_host_requests);
     if (link->last_error[0]) printf("FUXI modem: last error: %s\n", link->last_error);
 }
 
