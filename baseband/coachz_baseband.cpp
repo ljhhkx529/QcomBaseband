@@ -36,7 +36,7 @@
 // NAS frames left the SIM and registration state stale until the SIM was reinserted. A dropped frame is a lost answer: keep room.
 #define BB_QUEUE 1024u
 #define BB_READS 8u                      // asynchronous reads waiting for a frame, per channel
-#define BB_TX 64u                        // QMI messages waiting for the Wi-Fi thread
+#define BB_TX 256u                       // QMI messages waiting for the Wi-Fi thread (a boot burst can be 400+ frames)
 #define BB_SYNC_READ_SECONDS 30u
 
 // Which SAHARA images the device end asks for. SBL1 (Qualcomm image id 0x15) is the first image a boot loader requests; the rest of
@@ -1922,7 +1922,7 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
 extern "C" void coachz_baseband_poll(void)
 {
   if (!bb_lock || !bb_send) return;
-  bb_tx batch[16];
+  bb_tx batch[64];
   uint32_t n = 0, released[16], r = 0, port;
   IOLockLock(bb_lock);
   bb_ssctl_step();
@@ -1931,7 +1931,7 @@ extern "C" void coachz_baseband_poll(void)
   bb_radio_step();
   bb_esim_step();
   if (bb_lpm_pending == 1) { bb_lpm_pending = 2; bb_lpm_send(); }
-  while (bb_tx_count && n < 16) {
+  while (bb_tx_count && n < 64) {
     batch[n++] = bb_txq[bb_tx_head];
     bb_tx_head = (bb_tx_head + 1) % BB_TX;
     bb_tx_count--;
@@ -1947,7 +1947,7 @@ extern "C" void coachz_baseband_poll(void)
      keeps trying the rest; every skipped frame of a blocked destination stays behind the refused one, which keeps
      that destination's FIFO order, and all the kept frames go back in front of the queue in their original order. */
   struct { uint32_t node, port; } blocked[8];
-  bb_tx kept[16];
+  bb_tx kept[64];
   uint32_t blocked_n = 0, kept_n = 0;
   for (uint32_t i = 0; i < n; i++) {
     bool skip = false;
