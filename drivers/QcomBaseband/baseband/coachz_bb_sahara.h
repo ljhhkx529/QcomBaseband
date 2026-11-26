@@ -259,24 +259,25 @@ static inline uint32_t cbs_receive(struct cbs_device *d, const uint8_t *in, uint
     }
     if (d->state == CBS_WAIT_DONE && command == CBS_DONE) {
         const int last = d->image_index + 1u >= d->image_count;
+        /* EXPERIMENT: walk the Mav16 image chain; ask for the next image before answering DONE, so the
+           host never leaves the sahara session between images. */
+        static const uint32_t chain[] = { 0x15u, 0x2u, 0x3u, 0x4u, 0x5u, 0x6u, 0x7u, 0x8u, 0x9u };
+        uint32_t next = 0;
+        if (last) {
+            const uint32_t id = d->images[d->image_index];
+            for (uint32_t i = 0; i + 1u < sizeof chain / sizeof chain[0]; i++)
+                if (chain[i] == id) { next = chain[i + 1u]; break; }
+        }
+        if (last && next) {
+            d->images[d->image_index] = next;
+            cbs_read(d, o, 0, CBS_ELF_PROBE);
+            d->state = CBS_WAIT_SEGMENT;
+            return length;
+        }
         uint8_t *p = cbs_packet(o, CBS_DONE_RESP, 0x0c);
         cbs_put32(p + 8, last ? 1u : 0u);
         if (last) {
-            /* EXPERIMENT: walk the Mav16 image chain, each served image asks for the next. */
-            static const uint32_t chain[] = { 0x15u, 0x2u, 0x3u, 0x4u, 0x5u, 0x6u, 0x7u, 0x8u, 0x9u };
-            const uint32_t id = d->images[d->image_index];
-            uint32_t next = 0;
-            for (uint32_t i = 0; i + 1u < sizeof chain / sizeof chain[0]; i++)
-                if (chain[i] == id) { next = chain[i + 1u]; break; }
-            if (next) {
-                /* the chain continues: tell the host more images follow, then ask for the next one */
-                cbs_put32(p + 8, 0u);
-                d->images[d->image_index] = next;
-                cbs_read(d, o, 0, CBS_ELF_PROBE);
-                d->state = CBS_WAIT_SEGMENT;
-            } else {
-                d->state = CBS_FINISHED;
-            }
+            d->state = CBS_FINISHED;
         } else {
             d->image_index++;
             cbs_hello(o, CBS_MODE_IMAGE_PENDING);
