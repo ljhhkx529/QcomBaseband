@@ -1706,6 +1706,13 @@ public:
     uint32_t nout = args->scalarOutputCount < 4 ? args->scalarOutputCount : 4;
     IOLockLock(bb_lock);
     const int result = cbc_call(&bb_control, selector, args->scalarInput, args->scalarInputCount, out, &nout);
+    /* Every BootController step ABM takes: which selector, what it wrote or read, and the two states it reads back.
+       The counters in the periodic line only say how many calls happened, not where the state machine stopped. */
+    printf("COACHZ board: sel %u in %u", selector, args->scalarInputCount);
+    for (uint32_t i = 0; i < args->scalarInputCount && i < 4; i++) printf(" %llx", (unsigned long long)args->scalarInput[i]);
+    printf(" out %u", nout);
+    for (uint32_t i = 0; i < nout && i < 4; i++) printf(" %llx", (unsigned long long)out[i]);
+    printf(" res %d mgr %llu bb %llu\n", result, (unsigned long long)bb_control.manager_state, (unsigned long long)bb_control.baseband_state);
     // A reset or power-on goes back to before SendImage: nothing greets until the next one.
     if (!result && (selector == CBC_RESET_MODEM || selector == CBC_POWERCYCLE || (selector == CBC_POWER && args->scalarInputCount && args->scalarInput[0]))) {
       bb_boot_image_sent = false;
