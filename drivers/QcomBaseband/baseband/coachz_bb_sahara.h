@@ -269,6 +269,8 @@ static inline uint32_t cbs_receive(struct cbs_device *d, const uint8_t *in, uint
             for (uint32_t i = 0; i + 1u < sizeof chain / sizeof chain[0]; i++)
                 if (chain[i] == id) { next = chain[i + 1u]; break; }
             if (next) {
+                /* the chain continues: tell the host more images follow, then ask for the next one */
+                cbs_put32(p + 8, 0u);
                 d->images[d->image_index] = next;
                 cbs_read(d, o, 0, CBS_ELF_PROBE);
                 d->state = CBS_WAIT_SEGMENT;
