@@ -301,6 +301,35 @@ uint32_t qrtr_flow_pending(const struct qrtr_state *q, uint32_t node, uint32_t p
     return 0xffffffffu;
 }
 
+/* The stall window: a destination held at the high watermark this long gets its credit back. The peer's
+   RESUME_TX travels on the same link as the data, and the peer's own transmit queue can refuse it; upstream's
+   accounting has no recovery for that, which is how one destination ends up refused forever while every other
+   destination still flows. The peer's transport drops what it cannot take (GLINK's intents), so a packet sent
+   past a stale count is not worse than a packet that never leaves. */
+#define QRTR_FLOW_STALL_MS 300u
+void qrtr_flow_tick(struct qrtr_state *q, uint32_t now_ms)
+{
+    for (uint32_t i = 0; i < QRTR_MAX_FLOWS; i++) {
+        struct qrtr_flow *f = &q->flow[i];
+        if (!f->used) continue;
+        if (f->pending < QRTR_TX_FLOW_HIGH) {
+            f->high_since = 0;
+            continue;
+        }
+        if (!f->high_since) {
+            f->high_since = now_ms ? now_ms : 1u;
+            continue;
+        }
+        const uint32_t held = now_ms - f->high_since;
+        if (held < QRTR_FLOW_STALL_MS) continue;
+#ifdef KERNEL
+        printf("COACHZ qrtr: flow recovered node %u port %u after %u ms\n", f->node, f->port, held);
+#endif
+        f->pending = 0;
+        f->high_since = 0;
+        q->flows_recovered++;
+    }
+}
 int qrtr_resume_tx(struct qrtr_state *q, uint32_t node, uint32_t port)
 {
     struct qrtr_flow *f = flow_find(q, node, port, 0);

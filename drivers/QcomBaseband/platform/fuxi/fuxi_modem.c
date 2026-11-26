@@ -769,6 +769,7 @@ void fuxi_modem_poll(void)
 {
     fuxi_modem_link *link = &fuxi_link;
     if (!link->channel) return;
+    qrtr_flow_tick(&link->qrtr, fuxi_modem_now_ms());
     qcom_glink_poll(&link->glink);
     /* The IPA's windows, mapped once the link is up: the addresses are the device tree's, and mapping them is the
        step that has to come before the handshake's INIT_DRIVER can carry anything real. */

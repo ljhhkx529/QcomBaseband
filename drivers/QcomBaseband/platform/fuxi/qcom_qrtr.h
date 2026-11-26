@@ -167,9 +167,13 @@ struct qrtr_state {
     struct qrtr_flow {
         uint32_t node, port;
         uint32_t pending;   /* the DATA packets the peer has not credited yet */
+        uint32_t high_since; /* ms when pending reached the high watermark; 0 while below it */
         uint8_t used;
     } flow[QRTR_MAX_FLOWS];
     uint32_t resumes_sent, resumes_received;
+    /* Destinations whose credit sat at the high watermark past the stall window: a RESUME_TX that never came
+       would otherwise hold the destination for the life of the link. */
+    uint32_t flows_recovered;
     /* Counters for the log. */
     uint32_t tx, rx, dropped, malformed, hello_dropped;
     char last_error[96];
@@ -177,6 +181,9 @@ struct qrtr_state {
     uint8_t scratch[QRTR_MAX_PACKET];
 };
 
+/* Ages the credit of every destination: one held at its high watermark past the stall window gets its count
+   back, so a RESUME_TX the peer lost (or its transmit queue refused) cannot deadlock the destination. */
+void qrtr_flow_tick(struct qrtr_state *q, uint32_t now_ms);
 /* Resets the protocol state and sends HELLO. */
 void qrtr_init(struct qrtr_state *q, uint32_t local_node, qrtr_send_fn send, qrtr_server_fn server,
                void *context);
