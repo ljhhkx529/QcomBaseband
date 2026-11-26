@@ -118,6 +118,8 @@ static int bb_dms_slot = -1;
 static struct cbn_probe bb_serving;
 static int bb_serving_slot = -1;
 static struct cbn_probe bb_signal;
+static int bb_radio_next;      /* next re-ask, ms */
+static int bb_radio_tries;     /* how many times the signal/serving pair went out again */
 static int bb_signal_slot = -1;
 static struct cbn_radio bb_radio;
 
@@ -770,6 +772,28 @@ static void bb_radio_ask(struct cbn_probe *probe, int *slot, uint32_t service, u
   const uint32_t queued = bb_tx_count;
   bb_queue_tx(CBQ_PORT_BASE + (uint32_t)*slot, server->node, server->port, sdu, n);
   if (bb_tx_count != queued) probe->sent = 1;
+}
+
+/* The first pair goes out at bring-up, when the modem's NAS is still initialising and answers
+   result 1, error 0x4a. Ask again at 10 s intervals, four times, so the log carries what the radio
+   says once it is ready: signal strength and the serving system's registration state. */
+static void bb_radio_again(void)
+{
+  if (bb_radio_tries >= 4) return;
+  const uint32_t now = bb_now_ms();
+  if (bb_radio_next && now < (uint32_t)bb_radio_next) return;
+  const struct cbq_server *nas = cbq_server_find(&bb_qmux, CBN_SVC_NAS);
+  if (!nas) return;
+  ++bb_radio_tries;
+  bb_radio_next = (int)(now + 10000u);
+  uint8_t sdu[32];
+  uint32_t n = cbn_build_request(sdu, sizeof sdu, 0x60u + (uint32_t)bb_radio_tries, CBN_NAS_GET_SIGNAL_INFO);
+  if (n && bb_signal_slot >= 0)
+    bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_signal_slot, nas->node, nas->port, sdu, n);
+  n = cbn_build_request(sdu, sizeof sdu, 0x70u + (uint32_t)bb_radio_tries, CBN_NAS_GET_SERVING_SYSTEM);
+  if (n && bb_serving_slot >= 0)
+    bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_serving_slot, nas->node, nas->port, sdu, n);
+  printf("COACHZ radio: signal and serving system asked again %d, t %u\n", bb_radio_tries, now);
 }
 
 // The three requests, in the order they are worth asking in.
@@ -1929,6 +1953,7 @@ extern "C" void coachz_baseband_poll(void)
   bb_uim_step();
   bb_uim_poll_step();
   bb_radio_step();
+  bb_radio_again();
   bb_esim_step();
   if (bb_lpm_pending == 1) { bb_lpm_pending = 2; bb_lpm_send(); }
   while (bb_tx_count && n < 64) {
