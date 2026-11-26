@@ -41,7 +41,7 @@
 
 // Which SAHARA images the device end asks for. SBL1 (Qualcomm image id 0x15) is the first image a boot loader requests; the rest of
 // a Mav16 boot (rpm, tz, apps, acdb, mba, qdsp6sw in the bbfw) follow once BBUpdater's log shows how it takes this one.
-static const uint32_t bb_sahara_images[] = { 0x15 };
+static const uint32_t bb_sahara_images[] = { 0x15, 0x2 };
 
 namespace {
 struct bb_frame { uint32_t len; uint8_t *data; };

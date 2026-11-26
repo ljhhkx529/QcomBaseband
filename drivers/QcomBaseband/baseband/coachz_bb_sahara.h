@@ -258,13 +258,12 @@ static inline uint32_t cbs_receive(struct cbs_device *d, const uint8_t *in, uint
         }
     }
     if (d->state == CBS_WAIT_DONE && command == CBS_DONE) {
-        if (d->images[d->image_index] == 0x2u) { d->state = CBS_FAILED; return length; }
         const int last = d->image_index + 1u >= d->image_count;
         uint8_t *p = cbs_packet(o, CBS_DONE_RESP, 0x0c);
         cbs_put32(p + 8, last ? 1u : 0u);
         if (last) {
-            /* EXPERIMENT: probe whether the host serves image 0x2 after SBL1, the next id a Mav16 boot asks for. */
-            d->images[d->image_index] = 0x2u;
+            /* EXPERIMENT: after image 0x2 the Mav16 boot asks for 0x3; probe it the same way. */
+            d->images[d->image_index] = 0x3u;
             cbs_read(d, o, 0, CBS_ELF_PROBE);
             d->state = CBS_WAIT_SEGMENT;
         } else {
