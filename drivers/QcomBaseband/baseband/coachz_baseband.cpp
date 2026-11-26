@@ -820,6 +820,7 @@ static void bb_radio_again(void)
  *
  * The three asks go on one client of the bridge's own, and the serving system and the signal are asked again
  * on it every two seconds until registered, so the state the log shows is the state the modem is in. */
+static void bb_radio_log(void);
 static int bb_reg_slot = -1;
 static struct cbn_probe bb_reg;
 static uint8_t bb_reg_step;
