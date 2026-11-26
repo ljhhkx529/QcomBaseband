@@ -1964,6 +1964,7 @@ extern "C" void coachz_baseband_poll(void)
      two 256-entry copies (the first attempt overflowed the kernel stack). */
   static bb_tx batch[BB_TX];
   uint32_t n = 0, released[16], r = 0, port;
+  const uint32_t now_ms_hold = bb_now_ms();
   IOLockLock(bb_lock);
   bb_ssctl_step();
   bb_uim_step();
