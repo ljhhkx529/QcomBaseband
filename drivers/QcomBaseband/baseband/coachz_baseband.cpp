@@ -98,7 +98,11 @@ static int bb_ssctl_slot = -1;
 // speaks when a client asks it to, and a physical card is not that: reading card slot one is one request.
 static struct cbp_uim bb_uim;
 static int bb_uim_slot = -1;
-static int bb_session_sent;
+static int bb_session_tries;   /* session change attempts */
+static int bb_session_at;      /* next attempt, ms */
+static void bb_uim_session_try(const uint8_t *v10, uint32_t l10);
+static int bb_uim_seq;          /* card power cycle state */
+static int bb_uim_seq_at;       /* next step, ms */
 static int bb_uim_poll_at;      /* next poll, ms */
 static int bb_uim_poll_count;   /* polls sent */
 static int bb_uim_ready;        /* an answer has said app 7 */
@@ -200,23 +204,10 @@ static void bb_trace(const char *dir, uint32_t channel, uint32_t service, uint32
   /* UIM card status indication: when the slot's USIM application is detected (state 1) but not ready (7),
      bind it to the primary GW session. Apple firmware does this itself; this modem leaves the application at
      DETECTED until the host asks (QMI UIM Change Provisioning Session 0x38). */
-  if (service == 0xbu && message == 0x32u && type == 4u && bb_uim_slot >= 0 && !bb_session_sent) {
-    uint32_t l10 = 0, l14 = 0;
+  if (service == 0xbu && message == 0x32u && type == 4u && bb_uim_seq >= 3) {
+    uint32_t l10 = 0;
     const uint8_t *v10 = cbd_find(sdu, n, 0x10, &l10);
-    const uint8_t *a14 = cbd_find(sdu, n, 0x14, &l14);
-    const uint32_t app_state = (v10 && l10 >= 17u && v10[14]) ? v10[16] : 0u;
-    if (app_state != 7u && a14 && l14 >= 2u) {
-      const struct cbq_server *srv = cbq_server_find(&bb_qmux, CBE_SVC_UIM);
-      uint8_t rsdu[64];
-      const uint32_t m = srv ? cbp_build_session(rsdu, sizeof rsdu, 0x50u, CBP_UIM_CHANGE_SESSION,
-                                                 CBP_UIM_SESSION_PRIMARY_GW, 0u, 1u, a14 + 1, (uint8_t)(l14 - 1u)) : 0u;
-      if (m) {
-        bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_uim_slot, srv->node, srv->port, rsdu, m);
-        bb_session_sent = 1;
-        printf("COACHZ uim: session change sent, app_state %u, aid %u bytes, t %u\n",
-               app_state, l14 - 1u, bb_now_ms());
-      }
-    }
+    if (v10) bb_uim_session_try(v10, l10);
   }
   /* DMS operating mode: the request's mode value and the answer's result/error, one line each and outside the
      dedup and the budget below. The mode is what says whether the upper layer asks for online (0) or low power
@@ -659,36 +650,41 @@ static void bb_ssctl_step(void)
 //
 // The request is asked once. A queue that was full is asked again on the next poll, and a request that did go
 // out is not asked again: the card's state does not change while the modem runs.
+/* Power Off, settle, Power On, settle, then the asks. The USIM application has been reported at state 1
+   (detected) on every boot, and the one earlier run that sent 0x30 alone made the card absent, which is
+   Power Off's own result: the card's power state was never driven on after its initial bring-up. The
+   sequence is a fresh card power cycle on the bridge's own client; nothing else in the card is written. */
 static void bb_uim_step(void)
 {
   const struct cbq_server *server = cbq_server_find(&bb_qmux, CBP_SVC_UIM);
   if (!server) return;
   if (bb_uim_slot < 0) bb_uim_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, CBP_SVC_UIM);
   if (bb_uim_slot < 0) return;
-  if (bb_uim.sent || bb_uim.answered) return;
+  if (bb_uim_seq >= 3) return;
+  const uint32_t now = bb_now_ms();
+  if (bb_uim_seq_at && now < (uint32_t)bb_uim_seq_at) return;
   uint8_t sdu[32];
-  /* Read-only asks on the bridge's own UIM client, one boot: register the card events with the same mask the upper
-     layer uses, the card status, the slot status, and the two identity files (EF_ICCID 0x2fe2 and EF_IMSI 0x6f07).
-     Their answers are dumped raw by bb_trace; the identity files are also parsed by bb_sim_answer, so a card the
-     modem's database does not name can still be read and put into the activation indication. */
   const uint32_t port = CBQ_PORT_BASE + (uint32_t)bb_uim_slot;
   const uint32_t queued = bb_tx_count;
-  static const uint8_t path_iccid[] = { 0x3fu, 0x00u };
-  static const uint8_t path_imsi[] = { 0x3fu, 0x00u, 0x7fu, 0x20u };
-  static const uint8_t power_on_slot[] = { 0x01u };
+  static const uint8_t slot_one[] = { 0x01u };
   uint32_t n;
-  /* Power On was tried and made the modem report the card absent, so it stays out. */
-  (void)power_on_slot;
-  if ((n = cbp_build_register(sdu, sizeof sdu, 0x40u)) != 0u)
-    bb_queue_tx(port, server->node, server->port, sdu, n);
-  if ((n = cbp_build_request(sdu, sizeof sdu, 0x41u, 0x2fu)) != 0u)
-    bb_queue_tx(port, server->node, server->port, sdu, n);
-  if ((n = cbp_build_request(sdu, sizeof sdu, 0x42u, CBP_UIM_GET_SLOT_STATUS)) != 0u)
-    bb_queue_tx(port, server->node, server->port, sdu, n);
-  /* The identity files are not read here: the reference bridge (UMi, umi_modem_qmi.h) only asks for the card
-     status and sniffs the upper layer's own ReadTransparent answers. The direct read got QMI error 0x11 because
-     the USIM application is still in state 1 (detected), not 7 (ready); leave the read to CommCenter. */
-  (void)path_iccid; (void)path_imsi;
+  if (bb_uim_seq == 0) {
+    if ((n = cbp_build_tlv(sdu, sizeof sdu, 0x44u, CBP_UIM_POWER_OFF, 0x01u, slot_one, 1u)) != 0u)
+      bb_queue_tx(port, server->node, server->port, sdu, n);
+    bb_uim_seq = 1; bb_uim_seq_at = (int)(now + 800u);
+  } else if (bb_uim_seq == 1) {
+    if ((n = cbp_build_tlv(sdu, sizeof sdu, 0x45u, CBP_UIM_POWER_ON, 0x01u, slot_one, 1u)) != 0u)
+      bb_queue_tx(port, server->node, server->port, sdu, n);
+    bb_uim_seq = 2; bb_uim_seq_at = (int)(now + 800u);
+  } else {
+    if ((n = cbp_build_register(sdu, sizeof sdu, 0x40u)) != 0u)
+      bb_queue_tx(port, server->node, server->port, sdu, n);
+    if ((n = cbp_build_request(sdu, sizeof sdu, 0x41u, 0x2fu)) != 0u)
+      bb_queue_tx(port, server->node, server->port, sdu, n);
+    if ((n = cbp_build_request(sdu, sizeof sdu, 0x42u, CBP_UIM_GET_SLOT_STATUS)) != 0u)
+      bb_queue_tx(port, server->node, server->port, sdu, n);
+    bb_uim_seq = 3;
+  }
   if (bb_tx_count != queued) bb_uim.sent = 1;
 }
 
@@ -712,6 +708,30 @@ static void bb_uim_poll_step(void)
   const uint32_t queued = bb_tx_count;
   bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_uim_slot, server->node, server->port, sdu, n);
   if (bb_tx_count != queued) bb_uim_poll_count++;
+}
+
+/* Ask the modem to bind the slot's USIM application to the primary GW provisioning session, with the AID the
+   card itself reports. libqmi's Change Provisioning Session: TLV 0x01 { u8 session_type, u8 activate } and
+   TLV 0x10 { u8 slot, u8 aid_len, u8 aid[] }. Up to three attempts, 15 s apart. */
+static void bb_uim_session_try(const uint8_t *v10, uint32_t l10)
+{
+  if (bb_uim_slot < 0 || bb_uim_seq < 3 || bb_session_tries >= 3) return;
+  const uint32_t now = bb_now_ms();
+  if (bb_session_at && now < (uint32_t)bb_session_at) return;
+  uint32_t cards = 0, app_state = 0, aid_len = 0;
+  uint8_t aid[32];
+  if (!cbp_card_usim_aid(v10, l10, &cards, &app_state, aid, &aid_len) || app_state == 7u || !aid_len) return;
+  const struct cbq_server *srv = cbq_server_find(&bb_qmux, CBE_SVC_UIM);
+  if (!srv) return;
+  uint8_t rsdu[64];
+  const uint32_t m = cbp_build_session(rsdu, sizeof rsdu, 0x50u + (uint32_t)bb_session_tries,
+                                       CBP_UIM_SESSION_PRIMARY_GW, 1u, 1u, aid, (uint8_t)aid_len);
+  if (!m) return;
+  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_uim_slot, srv->node, srv->port, rsdu, m);
+  ++bb_session_tries;
+  bb_session_at = (int)(now + 15000u);
+  printf("COACHZ uim: session change %d sent, app_state %u, aid %u bytes, t %u\n",
+         bb_session_tries, app_state, aid_len, now);
 }
 
 // The modem's answer about the card, on the record.
@@ -1770,7 +1790,7 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
     const uint8_t *sdu = static_cast<const uint8_t *>(body);
     const uint32_t m = (uint32_t)(sdu[3] | sdu[4] << 8);
     const uint32_t type = sdu[0];
-    if (m == 0x2eu || m == 0x2fu || m == 0x30u || m == 0x20u || m == 0x32u || m == 0x47u || m == 0x48u) {
+    if (m == 0x2eu || m == 0x2fu || m == 0x30u || m == 0x31u || m == 0x20u || m == 0x32u || m == 0x47u || m == 0x48u) {
       printf("COACHZ uim: %s msg 0x%x cid %u txn %u len %u bytes:",
              type == 4u ? "indication" : "answer", m, r.cid,
              (uint32_t)(sdu[1] | sdu[2] << 8), size);
@@ -1802,6 +1822,7 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
             }
             printf("COACHZ uim:   card-status UMi: slots=%u card_state=%u inserted=%u apps=%u app1_state=%u (len %u)\n",
                    slots, card, (slots != 0u && card == 1u) ? 1u : 0u, apps, app_state, l);
+            if ((m == 0x2fu && type == 2u) || (m == 0x32u && type == 4u)) bb_uim_session_try(v, l);
           }
           at += 3u + l;
         }
