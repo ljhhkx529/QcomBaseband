@@ -1440,9 +1440,21 @@ IOReturn AppleBasebandPCIUserClient::read(IOExternalMethodArguments *args)
     }
     IOLockLock(bb_lock);
     bb_channel *ch = &bb_ch[fChannel];
-    static uint32_t refs_reads;
+    static uint32_t refs_reads, refs_answered;
     if (fChannel == CBH_REFS && refs_reads++ < 6)
       printf("COACHZ baseband: refs read waiting, request %u bytes, %u in queue\n", r.len, ch->count);
+    /* EXPERIMENT: the host reads the reference channel right after the SBL transfer and waits for a record;
+       answer with zeros once so its state machine can be observed (does it move to boot/26/27?). */
+    if (fChannel == CBH_REFS && refs_answered < 1 && r.len) {
+      uint8_t *zero = static_cast<uint8_t *>(IOMallocData(r.len));
+      if (zero) {
+        memset(zero, 0, r.len);
+        bb_push(CBH_REFS, zero, r.len);
+        IOFreeData(zero, r.len);
+        refs_answered++;
+        printf("COACHZ baseband: refs answered with %u zero bytes\n", r.len);
+      }
+    }
     const bool queued = ch->reads_waiting < BB_READS;
     if (queued) ch->reads[ch->reads_waiting++] = r;
     if (queued && ch->count && bb_complete_call) thread_call_enter(bb_complete_call);
