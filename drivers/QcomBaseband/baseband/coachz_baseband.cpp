@@ -2097,12 +2097,12 @@ extern "C" void coachz_baseband_poll(void)
      about the next frame for another destination. The pass therefore blocks only the destination that refused and
      keeps trying the rest; every skipped frame of a blocked destination stays behind the refused one, which keeps
      that destination's FIFO order, and all the kept frames go back in front of the queue in their original order. */
-  struct { uint32_t node, port; } blocked[8];
+  struct { uint32_t node, port; } blocked[64];
   static bb_tx kept[BB_TX];
   /* A destination whose last attempt the link refused waits a moment before it is tried again. Without this the
      refused frame comes back to the front of the queue on every poll and the modem's own service is retried
      thousands of times a second, which is what kept the NAS service too busy to register. */
-  struct { uint32_t node, port, until; } static hold[8];
+  struct { uint32_t node, port, until; } static hold[64];
   static uint32_t hold_count;
   uint32_t blocked_n = 0, kept_n = 0;
   for (uint32_t i = 0; i < n; i++) {
@@ -2129,13 +2129,13 @@ extern "C" void coachz_baseband_poll(void)
     bool have = false;
     for (uint32_t k = 0; k < hold_count; k++)
       if (hold[k].node == batch[i].node && hold[k].port == batch[i].port) { hold[k].until = now_ms_hold + 100u; have = true; }
-    if (!have && hold_count < 8u) {
+    if (!have && hold_count < 64u) {
       hold[hold_count].node = batch[i].node;
       hold[hold_count].port = batch[i].port;
       hold[hold_count].until = now_ms_hold + 100u;
       hold_count++;
     }
-    if (blocked_n < 8u) {
+    if (blocked_n < 64u) {
       blocked[blocked_n].node = batch[i].node;
       blocked[blocked_n].port = batch[i].port;
       blocked_n++;
