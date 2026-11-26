@@ -30,6 +30,14 @@
 /* NAS Get Serving System and Get Signal Info. */
 #define CBN_NAS_GET_SERVING_SYSTEM 0x0024u
 #define CBN_NAS_GET_SIGNAL_INFO 0x004fu
+/* NAS: the two messages that make the modem register, and the one that says how the network is chosen. */
+#define CBN_NAS_INITIATE_NETWORK_REGISTER 0x0022u
+#define CBN_NAS_GET_SYSTEM_SELECTION 0x0034u
+#define CBN_NAS_GET_SYSTEM_INFO 0x004du
+/* NAS Initiate Network Register: the register action TLV (1 = automatic). */
+#define CBN_TLV_REGISTER_ACTION 0x01u
+/* NAS Get System Selection Preference: the mode preference. */
+#define CBN_TLV_SELECTION_MODE 0x11u
 /* The result TLV, the same one the SSCTL and UIM answers carry. */
 #define CBN_TLV_RESULT 0x02u
 /* DMS: the operating mode. */

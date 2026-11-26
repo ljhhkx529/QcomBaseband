@@ -809,6 +809,69 @@ static void bb_radio_again(void)
   printf("COACHZ radio: signal and serving system asked again %d, t %u\n", bb_radio_tries, now);
 }
 
+/* ---- registration: what the UMI port does and this bridge did not ----------------------------------
+ *
+ * The modem does not register on its own. UMI's port (drivers/modem/hakios.mpss.c, sim_probe) sends three NAS
+ * requests after the radio is online -- Get System Selection Preference (0x34), Initiate Network Register
+ * (0x22, TLV 1 = automatic), Get System Info (0x4d) -- and only then does the serving system turn registered.
+ * This bridge only asked (0x24/0x4f): it read "not registered" back because nobody had asked the modem to
+ * register. The host cannot fill the gap either: CommCenter's QMUX registration path went through requests
+ * that this bridge drops, and the Apple private services it would use are not on this modem.
+ *
+ * The three asks go on one client of the bridge's own, and the serving system and the signal are asked again
+ * on it every two seconds until registered, so the state the log shows is the state the modem is in. */
+static int bb_reg_slot = -1;
+static struct cbn_probe bb_reg;
+static uint8_t bb_reg_step;
+static uint32_t bb_reg_txn = 0x5100u;
+static uint32_t bb_reg_next_ms;
+static int bb_reg_tries;
+
+static void bb_register_step(void)
+{
+  const struct cbq_server *nas = cbq_server_find(&bb_qmux, CBN_SVC_NAS);
+  if (!nas) return;
+  if (bb_reg_slot < 0) bb_reg_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, CBN_SVC_NAS);
+  if (bb_reg_slot < 0) return;
+  const uint32_t port = CBQ_PORT_BASE + (uint32_t)bb_reg_slot;
+  const uint32_t now = bb_now_ms();
+  uint8_t sdu[32];
+  if (bb_reg_step == 0u) {
+    uint32_t n = cbn_build_request(sdu, sizeof sdu, ++bb_reg_txn, CBN_NAS_GET_SYSTEM_SELECTION);
+    if (n) bb_queue_tx(port, nas->node, nas->port, sdu, n);
+    n = 0;
+    sdu[n++] = 0x00u;
+    sdu[n++] = (uint8_t)bb_reg_txn; sdu[n++] = (uint8_t)(bb_reg_txn >> 8);
+    sdu[n++] = (uint8_t)(CBN_NAS_INITIATE_NETWORK_REGISTER & 0xffu);
+    sdu[n++] = (uint8_t)(CBN_NAS_INITIATE_NETWORK_REGISTER >> 8);
+    sdu[n++] = 0x04u; sdu[n++] = 0x00u;                                   /* one TLV, four bytes */
+    sdu[n++] = CBN_TLV_REGISTER_ACTION; sdu[n++] = 0x01u; sdu[n++] = 0x00u; sdu[n++] = 0x01u;  /* automatic */
+    ++bb_reg_txn;
+    bb_queue_tx(port, nas->node, nas->port, sdu, n);
+    n = cbn_build_request(sdu, sizeof sdu, ++bb_reg_txn, CBN_NAS_GET_SYSTEM_INFO);
+    if (n) bb_queue_tx(port, nas->node, nas->port, sdu, n);
+    bb_reg_step = 1u;
+    bb_reg_next_ms = now + 3000u;
+    printf("COACHZ register: the selection, the automatic registration and the system info asked\n");
+    return;
+  }
+  if (bb_radio.have_serving && bb_radio.reg_state == CBN_REG_REGISTERED) {
+    if (bb_reg_step != 2u) {
+      bb_reg_step = 2u;
+      bb_radio_log();
+      printf("COACHZ register: the modem is registered\n");
+    }
+    return;
+  }
+  if (bb_reg_tries >= 30 || now < bb_reg_next_ms) return;
+  bb_reg_next_ms = now + 2000u;
+  ++bb_reg_tries;
+  uint32_t n = cbn_build_request(sdu, sizeof sdu, ++bb_reg_txn, CBN_NAS_GET_SERVING_SYSTEM);
+  if (n) bb_queue_tx(port, nas->node, nas->port, sdu, n);
+  n = cbn_build_request(sdu, sizeof sdu, ++bb_reg_txn, CBN_NAS_GET_SIGNAL_INFO);
+  if (n) bb_queue_tx(port, nas->node, nas->port, sdu, n);
+}
+
 // The three requests, in the order they are worth asking in.
 static void bb_radio_step(void)
 {
@@ -1906,6 +1969,24 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
           bb_lpm_step = 0;
         }
       }
+    } else if (bb_reg_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_reg_slot &&
+               r.service == CBN_SVC_NAS) {
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      bb_reg.tlv_count = 0;
+      if (cbn_read_answer(&bb_reg, sdu, size)) {
+        const uint32_t m = size >= 7u ? (uint32_t)(sdu[3] | sdu[4] << 8) : 0xffffu;
+        if (m == CBN_NAS_GET_SERVING_SYSTEM) {
+          cbn_take_serving_system(&bb_radio, sdu, size);
+          printf("COACHZ register: the serving system answer: error %u\n", bb_reg.error);
+          bb_radio_log();
+        } else if (m == CBN_NAS_GET_SIGNAL_INFO) {
+          cbn_take_signal(&bb_radio, sdu, size);
+          printf("COACHZ register: the signal answer: error %u\n", bb_reg.error);
+          bb_radio_log();
+        } else {
+          printf("COACHZ register: answer message 0x%x: error %u, %u TLVs\n", m, bb_reg.error, bb_reg.tlv_count);
+        }
+      }
     } else if (bb_serving_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_serving_slot &&
                r.service == CBN_SVC_NAS) {
       // The modem's answer about the network the radio is on.
@@ -1971,6 +2052,7 @@ extern "C" void coachz_baseband_poll(void)
   bb_uim_poll_step();
   bb_radio_step();
   bb_radio_again();
+  bb_register_step();
   bb_esim_step();
   if (bb_lpm_pending == 1) { bb_lpm_pending = 2; bb_lpm_send(); }
   while (bb_tx_count && n < BB_TX) {
