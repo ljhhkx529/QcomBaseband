@@ -75,9 +75,17 @@ static errno_t bb_pdp_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
       return ifnet_set_mtu(ifp, static_cast<uint32_t>(mtu));
     }
     case SIOCSIFFLAGS: case SIOCSIFADDR: case SIOCSIFDSTADDR: return 0;
-    default:
+    default: {
+      const uint8_t *b = static_cast<const uint8_t *>(data);
+      if (data && cmd == 0xc02c6938ul) {
+        printf("COACHZ pdp: ioctl 0x%lx unit %u data", cmd, ifnet_unit(ifp));
+        for (unsigned i = 0; i < 44; i++) printf(" %02x", b[i]);
+        printf("\n");
+        return 0;
+      }
       printf("COACHZ pdp: ioctl 0x%lx unit %u unsupported\n", cmd, ifnet_unit(ifp));
       return EOPNOTSUPP;
+    }
   }
 }
 static errno_t bb_pdp_output(ifnet_t ifp, mbuf_t m)
