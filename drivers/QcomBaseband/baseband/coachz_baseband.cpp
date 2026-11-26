@@ -1443,18 +1443,21 @@ IOReturn AppleBasebandPCIUserClient::read(IOExternalMethodArguments *args)
     static uint32_t refs_reads, refs_answered;
     if (fChannel == CBH_REFS && refs_reads++ < 6)
       printf("COACHZ baseband: refs read waiting, request %u bytes, %u in queue\n", r.len, ch->count);
-    /* EXPERIMENT: the loader version record, as the BBU loader prints "Version is %s": answer the first read
-       with the version text and see whether the host takes it as the loader version. */
-    if (fChannel == CBH_REFS && refs_answered < 1 && r.len) {
-      static const char version[] = "Mav16-11.00.01";
+    /* EXPERIMENT A: the BBU loader version record the host prints as "Max write size %u, Protocol version %u"
+       and "%s: supports REFS %d": max write size, protocol version, REFS flag, then the version string. */
+    if (fChannel == CBH_REFS && refs_answered < 1 && r.len >= 16) {
       uint8_t *buf = static_cast<uint8_t *>(IOMallocData(r.len));
       if (buf) {
         memset(buf, 0, r.len);
-        __builtin_memcpy(buf, version, sizeof version - 1);
+        uint32_t *words = reinterpret_cast<uint32_t *>(buf);
+        words[0] = 0x8000;          /* max write size */
+        words[1] = 1;               /* protocol version */
+        words[2] = 1;               /* supports REFS */
+        __builtin_memcpy(buf + 12, "Mav16-11.00.01", 14);
         bb_push(CBH_REFS, buf, r.len);
         IOFreeData(buf, r.len);
         refs_answered++;
-        printf("COACHZ baseband: refs answered with the version text (%s)\n", version);
+        printf("COACHZ baseband: refs answered with loader version record A\n");
       }
     }
     const bool queued = ch->reads_waiting < BB_READS;
