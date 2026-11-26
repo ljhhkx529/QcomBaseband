@@ -54,6 +54,72 @@ static inline uint32_t cbp_build_request(uint8_t *sdu, uint32_t room, uint32_t t
     return 7u;
 }
 
+/* Power On (0x30): TLV 0x01 {u8 slot}, the standard step that makes the card readable. */
+#define CBP_UIM_POWER_ON 0x0030u
+static inline uint32_t cbp_build_tlv(uint8_t *sdu, uint32_t room, uint32_t txn, uint32_t message,
+                                     uint8_t type, const uint8_t *value, uint32_t value_len)
+{
+    if (value_len > 0xffu || room < 7u + 3u + value_len) return 0;
+    sdu[0] = 0x00u; sdu[1] = (uint8_t)txn; sdu[2] = 0x00u;
+    sdu[3] = (uint8_t)message; sdu[4] = (uint8_t)(message >> 8);
+    const uint32_t tl = 3u + value_len;
+    sdu[5] = (uint8_t)tl; sdu[6] = (uint8_t)(tl >> 8);
+    sdu[7] = type; sdu[8] = (uint8_t)value_len; sdu[9] = 0x00u;
+    for (uint32_t i = 0; i < value_len; ++i) sdu[10 + i] = value[i];
+    return 10u + value_len;
+}
+
+/* Register Events with the card-status event mask the upper layer uses (TLV 0x01, four bytes, bit 0). */
+static inline uint32_t cbp_build_register(uint8_t *sdu, uint32_t room, uint32_t txn)
+{
+    if (room < 14u) return 0;
+    sdu[0] = 0x00u; sdu[1] = (uint8_t)txn; sdu[2] = 0x00u;
+    sdu[3] = 0x2eu; sdu[4] = 0x00u; sdu[5] = 0x07u; sdu[6] = 0x00u;
+    sdu[7] = 0x01u; sdu[8] = 0x04u; sdu[9] = 0x00u;
+    sdu[10] = 0x01u; sdu[11] = 0x00u; sdu[12] = 0x00u; sdu[13] = 0x00u;
+    return 14u;
+}
+
+/* Read Transparent (0x20): TLV 0x02 {u16 file, u8 path length, path} (coachz_bb_data.h, cbd_uim_read_file). */
+static inline uint32_t cbp_build_read(uint8_t *sdu, uint32_t room, uint32_t txn, uint16_t file,
+                                      const uint8_t *path, uint8_t path_len)
+{
+    const uint32_t tl = 2u + 1u + path_len;
+    if (path_len > 8u || room < 7u + 3u + tl) return 0;
+    sdu[0] = 0x00u; sdu[1] = (uint8_t)txn; sdu[2] = 0x00u;
+    sdu[3] = 0x20u; sdu[4] = 0x00u; sdu[5] = (uint8_t)(3u + tl); sdu[6] = (uint8_t)((3u + tl) >> 8);
+    uint32_t at = 7u;
+    sdu[at++] = 0x02u; sdu[at++] = (uint8_t)tl; sdu[at++] = 0x00u;
+    sdu[at++] = (uint8_t)file; sdu[at++] = (uint8_t)(file >> 8);
+    sdu[at++] = path_len;
+    for (uint32_t i = 0; i < path_len; ++i) sdu[at++] = path[i];
+    return at;
+}
+
+/* Change Provisioning Session (0x38): TLV 0x01 {u8 session_type, u16 session_id} and
+   TLV 0x10 {u8 slot, u8 aid_len, u8 aid[]} (libqmi uim-service: Change Provisioning Session). */
+#define CBP_UIM_CHANGE_SESSION 0x0038u
+#define CBP_UIM_SESSION_PRIMARY_GW 0u
+static inline uint32_t cbp_build_session(uint8_t *sdu, uint32_t room, uint32_t txn, uint32_t message,
+                                         uint8_t session_type, uint16_t session_id,
+                                         uint8_t slot, const uint8_t *aid, uint8_t aid_len)
+{
+    const uint32_t t1 = 3u + 3u;                 /* session change */
+    const uint32_t t10 = 3u + 2u + aid_len;      /* application information */
+    if (aid_len == 0u || room < 7u + t1 + t10) return 0;
+    sdu[0] = 0x00u; sdu[1] = (uint8_t)txn; sdu[2] = 0x00u;
+    sdu[3] = (uint8_t)message; sdu[4] = (uint8_t)(message >> 8);
+    const uint32_t tl = t1 + t10;
+    sdu[5] = (uint8_t)tl; sdu[6] = (uint8_t)(tl >> 8);
+    uint32_t at = 7u;
+    sdu[at++] = 0x01u; sdu[at++] = 0x03u; sdu[at++] = 0x00u;
+    sdu[at++] = session_type; sdu[at++] = (uint8_t)session_id; sdu[at++] = (uint8_t)(session_id >> 8);
+    sdu[at++] = 0x10u; sdu[at++] = (uint8_t)(2u + aid_len); sdu[at++] = 0x00u;
+    sdu[at++] = slot; sdu[at++] = aid_len;
+    for (uint32_t i = 0; i < aid_len; ++i) sdu[at++] = aid[i];
+    return at;
+}
+
 /* Reads the answer: the result and the list of TLVs the answer carried. Returns 1 when the answer was a response.
  *
  * The result TLV is type 0x02 and carries the error code in the last two bytes of its value (the same layout the

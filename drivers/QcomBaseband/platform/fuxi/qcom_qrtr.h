@@ -80,7 +80,7 @@ enum {
    The modem opens a new source port for every stream it starts, so the destinations come and go: the seven
    RMTFS requests of 2026-11-22 came from seven ports. The table is therefore larger than the number of ports
    the modem was seen to use, and a slot whose credit is all back is reused rather than the packet refused. */
-#define QRTR_MAX_FLOWS 32u
+#define QRTR_MAX_FLOWS 48u
 
 #define QRTR_MAX_SERVERS 64u
 /* The largest packet the layer assembles: the header plus a QMI SDU. */
@@ -220,6 +220,7 @@ int qrtr_flush_hello_reply(struct qrtr_state *q);
 /* The flow control of upstream's net/qrtr/af_qrtr.c. The peer stops answering once its high watermark of
    outstanding DATA packets is reached, and says so with RESUME_TX; the peer asks for the same when our packet
    carries the confirm_rx flag. */
+uint32_t qrtr_flow_pending(const struct qrtr_state *q, uint32_t node, uint32_t port);
 int qrtr_resume_tx(struct qrtr_state *q, uint32_t node, uint32_t port);
 int qrtr_send_resume_tx(struct qrtr_state *q, uint32_t peer_node, uint32_t peer_port, uint32_t our_node, uint32_t our_port);
 /* Hands one received QRTR packet (header and payload) to the protocol layer. */

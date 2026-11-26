@@ -7,6 +7,15 @@
 
 #include <string.h>
 
+/* The diagnostics below are kernel-only: the host model tests include this file directly and bring their own
+   stdio, so the header stays under the same guard the kernel build sets. */
+/* The portable layer has no kernel headers in its include path; the two symbols the diagnostics need are declared
+   here so the kernel build sees them and the host tests stay on their own stdio. */
+#ifdef KERNEL
+extern int printf(const char *fmt, ...);
+extern int snprintf(char *buf, unsigned long len, const char *fmt, ...);
+#endif
+
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static void wr32(uint8_t *p, uint32_t v)
 {
@@ -206,6 +215,57 @@ int qrtr_send_lookup_to(struct qrtr_state *q, uint32_t node, uint32_t service, u
    A slot whose credit is all back is free in every sense that matters: it holds no outstanding packet, and it is
    made again on demand with the same zero count. So a full table takes one of those over rather than refusing
    the packet. */
+/* Which of the two refusals happened, and what the flow table looks like when it did: the refusal path and the
+   credit path return the same -1, and the table being full is what stops a destination from ever getting a flow.
+   One line per destination and reason, then each power of two, plus a dump of all the slots at most once per
+   ten seconds; the counters keep the totals. */
+#ifdef KERNEL
+static void qrtr_send_why(struct qrtr_state *q, const char *why, uint32_t node, uint32_t port, uint32_t pending)
+{
+  struct { uint32_t key, count; } static seen[16];
+  static uint32_t dumps;
+  const uint32_t key = ((uint32_t)(why[0] == 't') << 31) | (node & 0xffffu) << 16 | (port & 0xffffu);
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < 16u; i++) {
+    if (seen[i].key != key && seen[i].key) continue;
+    seen[i].key = key;
+    count = ++seen[i].count;
+    break;
+  }
+  if (count == 0u || (count > 2u && (count & (count - 1u)))) return;
+  printf("COACHZ qrtr: %s node %u port %u pending %u (%u)\n", why, node, port, pending, count);
+  if (why[0] == 't' && (++dumps <= 2u || !(dumps & (dumps - 1u)))) {
+    char slots[QRTR_MAX_FLOWS * 26u];
+    uint32_t at = 0;
+    for (uint32_t i = 0; i < QRTR_MAX_FLOWS; i++) {
+      const struct qrtr_flow *fl = &q->flow[i];
+      at += (uint32_t)snprintf(slots + at, sizeof slots - at, "%u%s%u:%u.%u ", i, fl->used ? ":" : "-", fl->node, fl->port, fl->pending);
+      if (at + 30u >= sizeof slots) break;
+    }
+    slots[at < sizeof slots ? at : sizeof slots - 1u] = '\0';
+    printf("COACHZ qrtr: flow table: %s\n", slots);
+  }
+}
+#else
+static void qrtr_send_why(struct qrtr_state *q, const char *why, uint32_t node, uint32_t port, uint32_t pending)
+{
+  (void)q; (void)why; (void)node; (void)port; (void)pending;
+}
+#endif
+
+/* The three stages of the TX confirm handshake, one line each and only when a destination is being watched:
+   confirm_set on the DATA that crosses the low watermark, confirm_sent when that DATA actually leaves (a refused
+   send or a retried hold is not a send), and resume_rx when the peer frees the destination. The node and port say
+   which destination, the pending value says where the credit stood. */
+static void qrtr_confirm_note(const char *stage, uint32_t node, uint32_t port, uint32_t pending, uint32_t src_port, uint32_t matched)
+{
+#ifdef KERNEL
+  printf("COACHZ qrtr_confirm: %s node %u port %u pending %u src %u matched %u\n", stage, node, port, pending, src_port, matched);
+#else
+  (void)stage; (void)node; (void)port; (void)pending; (void)src_port; (void)matched;
+#endif
+}
+
 static struct qrtr_flow *flow_find(struct qrtr_state *q, uint32_t node, uint32_t port, int create)
 {
     struct qrtr_flow *free_slot = 0;
@@ -232,11 +292,27 @@ static struct qrtr_flow *flow_find(struct qrtr_state *q, uint32_t node, uint32_t
 
 /* The peer freed the credit for one destination. The RESUME_TX body names that destination, and the count for it
    starts over (Linux net/qrtr/af_qrtr.c, qrtr_tx_resume: `flow->pending = 0`). */
+/* Diagnostic: what the destination's flow holds, or ~0 when it has none. The adapter's held-packet retry reports
+   the confirm it sends, and the pending value belongs to the flow table here. */
+uint32_t qrtr_flow_pending(const struct qrtr_state *q, uint32_t node, uint32_t port)
+{
+    for (uint32_t i = 0; i < QRTR_MAX_FLOWS; i++)
+        if (q->flow[i].used && q->flow[i].node == node && q->flow[i].port == port) return q->flow[i].pending;
+    return 0xffffffffu;
+}
+
 int qrtr_resume_tx(struct qrtr_state *q, uint32_t node, uint32_t port)
 {
     struct qrtr_flow *f = flow_find(q, node, port, 0);
+#ifdef KERNEL
+    const uint32_t before = f ? f->pending : 0u;
+#endif
     if (f) f->pending = 0;
     q->resumes_received++;
+#ifdef KERNEL
+    printf("COACHZ qrtr: resume node %u port %u matched %u pending before %u\n", node, port, f ? 1u : 0u, before);
+    qrtr_confirm_note("resume_rx", node, port, before, 0u, f ? 1u : 0u);
+#endif
     return 1;
 }
 
@@ -315,15 +391,18 @@ int qrtr_send_from(struct qrtr_state *q, uint32_t src_port, uint32_t dst_node, u
         if (!flow) {
             /* No room for another destination's flow: the packet is refused rather than sent unaccounted for. */
             q->dropped++;
+            qrtr_send_why(q, "table full", dst_node, dst_port, 0u);
             return -1;
         }
         if (flow->pending >= QRTR_TX_FLOW_HIGH) {
             /* The peer is full. The packet waits for the RESUME_TX that frees the credit. */
             q->dropped++;
+            qrtr_send_why(q, "credit high", dst_node, dst_port, flow->pending);
             return -1;
         }
         flow->pending++;
         confirm_rx = flow->pending == QRTR_TX_FLOW_LOW;
+        if (confirm_rx) qrtr_confirm_note("confirm_set", dst_node, dst_port, flow->pending, src_port, 0u);
     }
     wr32(p + 16, confirm_rx);
     wr32(p + 20, length);
@@ -345,6 +424,8 @@ int qrtr_send_from(struct qrtr_state *q, uint32_t src_port, uint32_t dst_node, u
         }
     }
     const int result = q->send(q->context, src_port, dst_node, dst_port, p, QRTR_HDR_LEN + padded);
+    /* A held packet is retried in the adapter and reports itself there: only the send that returns 0 is a send. */
+    if (confirm_rx && result == 0) qrtr_confirm_note("confirm_sent", dst_node, dst_port, flow ? flow->pending : 0u, src_port, 0u);
     if (result) {
         /* The packet did not go out, so it does not count against the peer's credit: the peer never saw it. */
         if (flow && flow->pending) flow->pending--;
