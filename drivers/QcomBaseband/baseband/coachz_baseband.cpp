@@ -1440,6 +1440,9 @@ IOReturn AppleBasebandPCIUserClient::read(IOExternalMethodArguments *args)
     }
     IOLockLock(bb_lock);
     bb_channel *ch = &bb_ch[fChannel];
+    static uint32_t refs_reads;
+    if (fChannel == CBH_REFS && refs_reads++ < 6)
+      printf("COACHZ baseband: refs read waiting, request %u bytes, %u in queue\n", r.len, ch->count);
     const bool queued = ch->reads_waiting < BB_READS;
     if (queued) ch->reads[ch->reads_waiting++] = r;
     if (queued && ch->count && bb_complete_call) thread_call_enter(bb_complete_call);
@@ -1594,7 +1597,23 @@ public:
   bool matchProtocol(OSDictionary *table) const
   {
     OSString *wanted = OSDynamicCast(OSString, table->getObject(CBH_PROTOCOL_KEY));
-    return !wanted || wanted->isEqualTo(cbh_published[fChannel]);
+    if (!wanted) return true;
+    const bool same = wanted->isEqualTo(cbh_published[fChannel]);
+    if (!same) {
+      /* Every channel is asked for every protocol until one matches; print each requested name once so the
+         names ABM looks for but the table does not publish show up (a missing boot channel would show here). */
+      static char seen[24][24];
+      static uint32_t seen_count;
+      const char *name = wanted->getCStringNoCopy();
+      bool logged = false;
+      for (uint32_t i = 0; i < seen_count; i++)
+        if (!strncmp(seen[i], name, sizeof seen[i] - 1)) { logged = true; break; }
+      if (!logged && seen_count < sizeof seen / sizeof seen[0]) {
+        strlcpy(seen[seen_count++], name, sizeof seen[0]);
+        printf("COACHZ baseband: channel %s refused protocol \"%s\"\n", cbh_published[fChannel], name);
+      }
+    }
+    return same;
   }
   IOReturn newUserClient(task_t task, void *security, UInt32 type, OSDictionary *properties, IOUserClient **out) override
   {
