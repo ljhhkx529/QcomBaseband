@@ -262,10 +262,19 @@ static inline uint32_t cbs_receive(struct cbs_device *d, const uint8_t *in, uint
         uint8_t *p = cbs_packet(o, CBS_DONE_RESP, 0x0c);
         cbs_put32(p + 8, last ? 1u : 0u);
         if (last) {
-            /* EXPERIMENT: after image 0x2 the Mav16 boot asks for 0x3; probe it the same way. */
-            d->images[d->image_index] = 0x3u;
-            cbs_read(d, o, 0, CBS_ELF_PROBE);
-            d->state = CBS_WAIT_SEGMENT;
+            /* EXPERIMENT: walk the Mav16 image chain, each served image asks for the next. */
+            static const uint32_t chain[] = { 0x15u, 0x2u, 0x3u, 0x4u, 0x5u, 0x6u, 0x7u, 0x8u, 0x9u };
+            const uint32_t id = d->images[d->image_index];
+            uint32_t next = 0;
+            for (uint32_t i = 0; i + 1u < sizeof chain / sizeof chain[0]; i++)
+                if (chain[i] == id) { next = chain[i + 1u]; break; }
+            if (next) {
+                d->images[d->image_index] = next;
+                cbs_read(d, o, 0, CBS_ELF_PROBE);
+                d->state = CBS_WAIT_SEGMENT;
+            } else {
+                d->state = CBS_FINISHED;
+            }
         } else {
             d->image_index++;
             cbs_hello(o, CBS_MODE_IMAGE_PENDING);
