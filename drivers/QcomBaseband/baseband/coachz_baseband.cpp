@@ -885,6 +885,23 @@ static void bb_register_step(void)
   if (bb_reg_tries >= 30 || now < bb_reg_next_ms) return;
   bb_reg_next_ms = now + 2000u;
   ++bb_reg_tries;
+  /* The SIM only becomes READY (UIM application state 7) well after the first register request, so the
+     automatic registration asked for at bring-up is asked again every five polls (ten seconds): the first
+     one is answered 'no effect' while the card is still being initialised, and the modem registers only
+     once the USIM is ready (UMI's sim_register_again does the same). */
+  if (bb_reg_tries % 5 == 0) {
+    uint8_t auto_reg[11];
+    uint32_t k = 0;
+    auto_reg[k++] = 0x00u;
+    auto_reg[k++] = (uint8_t)bb_reg_txn; auto_reg[k++] = (uint8_t)(bb_reg_txn >> 8);
+    auto_reg[k++] = (uint8_t)(CBN_NAS_INITIATE_NETWORK_REGISTER & 0xffu);
+    auto_reg[k++] = (uint8_t)(CBN_NAS_INITIATE_NETWORK_REGISTER >> 8);
+    auto_reg[k++] = 0x04u; auto_reg[k++] = 0x00u;
+    auto_reg[k++] = CBN_TLV_REGISTER_ACTION; auto_reg[k++] = 0x01u; auto_reg[k++] = 0x00u; auto_reg[k++] = 0x01u;
+    ++bb_reg_txn;
+    bb_queue_tx(port, nas->node, nas->port, auto_reg, k);
+    printf("COACHZ register: the automatic registration asked again (%u)\n", bb_reg_tries);
+  }
   uint32_t n = cbn_build_request(sdu, sizeof sdu, ++bb_reg_txn, CBN_NAS_GET_SERVING_SYSTEM);
   if (n) bb_queue_tx(port, nas->node, nas->port, sdu, n);
   n = cbn_build_request(sdu, sizeof sdu, ++bb_reg_txn, CBN_NAS_GET_SIGNAL_INFO);
