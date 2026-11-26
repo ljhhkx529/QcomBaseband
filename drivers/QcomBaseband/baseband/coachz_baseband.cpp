@@ -193,8 +193,21 @@ static void bb_init(void)
 #define BB_TRACE_BUDGET 6000u
 static uint64_t bb_trace_key[BB_TRACE_KINDS];
 static uint32_t bb_trace_count[BB_TRACE_KINDS], bb_trace_lines, bb_trace_held;
+/* The CDC stream carries the console and the screenshot channel's replies together. In screenshot mode
+   (sheng-fb-gpu=2) the raw dump of every QMI frame would starve those replies, so keep the per-kind summary
+   and the periodic reports only. */
+static bool bb_trace_quiet(void)
+{
+  static int quiet = -1;
+  if (quiet < 0) {
+    unsigned v = 0;
+    quiet = (PE_parse_boot_argn("sheng-fb-gpu", &v, sizeof v) && v == 2) ? 1 : 0;
+  }
+  return quiet != 0;
+}
 static void bb_trace(const char *dir, uint32_t channel, uint32_t service, uint32_t cid, const uint8_t *sdu, uint32_t n)
 {
+  if (bb_trace_quiet()) return;
   if (!service || n < 7u) return;   // CTL has its own SDU layout and its own lines
   const uint32_t type = sdu[0], txn = cbd_rd16(sdu + 1), message = cbd_rd16(sdu + 3);
   /* Baseband probe: every message of the services that carry the card, the radio state and the activation, raw. */
