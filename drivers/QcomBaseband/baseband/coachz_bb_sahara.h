@@ -260,7 +260,8 @@ static inline uint32_t cbs_receive(struct cbs_device *d, const uint8_t *in, uint
     if (d->state == CBS_WAIT_DONE && command == CBS_DONE) {
         const int last = d->image_index + 1u >= d->image_count;
         uint8_t *p = cbs_packet(o, CBS_DONE_RESP, 0x0c);
-        cbs_put32(p + 8, last ? 1u : 0u);
+        /* 0 means the last image: with 1 the host reads it as "more images follow" and starts another session. */
+        cbs_put32(p + 8, last ? 0u : 1u);
         if (last) {
             d->state = CBS_FINISHED;
         } else {
