@@ -1181,12 +1181,17 @@ static void bb_host_write(uint32_t channel, const uint8_t *data, uint32_t len)
       /* Which sahara command the upper layer sent and what the state machine answered: the boot end stalls
          between HELLO, DONE and COMMAND_READY, and only the wire order shows which step is missing. */
       const uint32_t cmd = len - at >= 4u ? (uint32_t)data[at] | (uint32_t)data[at + 1] << 8 | (uint32_t)data[at + 2] << 16 | (uint32_t)data[at + 3] << 24 : ~0u;
-      printf("COACHZ sahara: rx cmd 0x%x len %u, state %u -> %u, %u out\n", cmd, used, (unsigned)step, (unsigned)bb_sahara.state, o.count);
+      printf("COACHZ sahara: rx cmd 0x%x len %u, state %u -> %u, %u out, seg %u/%u have %u expect %u remaining %u\n",
+             cmd, used, (unsigned)step, (unsigned)bb_sahara.state, o.count,
+             bb_sahara.segment, bb_sahara.segments, bb_sahara.have, bb_sahara.expect, bb_sahara.read_remaining);
       for (uint32_t i = 0; i < o.count; i++) {
         const uint8_t *p = o.data[i];
         const uint32_t tcmd = (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
         const uint32_t tlen = (uint32_t)p[4] | (uint32_t)p[5] << 8 | (uint32_t)p[6] << 16 | (uint32_t)p[7] << 24;
-        printf("COACHZ sahara: tx cmd 0x%x len %u\n", tcmd, tlen);
+        const uint32_t timg = (uint32_t)p[8] | (uint32_t)p[9] << 8 | (uint32_t)p[10] << 16 | (uint32_t)p[11] << 24;
+        const uint32_t toff = (uint32_t)p[12] | (uint32_t)p[13] << 8 | (uint32_t)p[14] << 16 | (uint32_t)p[15] << 24;
+        const uint32_t tlen2 = (uint32_t)p[16] | (uint32_t)p[17] << 8 | (uint32_t)p[18] << 16 | (uint32_t)p[19] << 24;
+        printf("COACHZ sahara: tx cmd 0x%x len %u img 0x%x off 0x%x len 0x%x\n", tcmd, tlen, timg, toff, tlen2);
         bb_push(CBH_SAHARA, o.data[i], o.len[i]);
       }
       if (!used) break;
