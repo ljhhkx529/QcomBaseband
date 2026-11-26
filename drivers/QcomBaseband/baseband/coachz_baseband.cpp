@@ -1181,9 +1181,15 @@ static void bb_host_write(uint32_t channel, const uint8_t *data, uint32_t len)
       /* Which sahara command the upper layer sent and what the state machine answered: the boot end stalls
          between HELLO, DONE and COMMAND_READY, and only the wire order shows which step is missing. */
       const uint32_t cmd = len - at >= 4u ? (uint32_t)data[at] | (uint32_t)data[at + 1] << 8 | (uint32_t)data[at + 2] << 16 | (uint32_t)data[at + 3] << 24 : ~0u;
-      printf("COACHZ sahara: rx cmd 0x%x len %u, state %u -> %u, %u out, seg %u/%u have %u expect %u remaining %u\n",
+      printf("COACHZ sahara: rx cmd 0x%x len %u, state %u -> %u, %u out, seg %u/%u have %u expect %u remaining %u",
              cmd, used, (unsigned)step, (unsigned)bb_sahara.state, o.count,
              bb_sahara.segment, bb_sahara.segments, bb_sahara.have, bb_sahara.expect, bb_sahara.read_remaining);
+      /* A HELLO response is where the host says which mode it wants next; the two words name it. */
+      if (cmd == 0x2u && used >= 24u) {
+        const uint32_t *w = (const uint32_t *)(const void *)(data + at);
+        printf(", hello status %u mode %u w8 %u w12 %u", w[4], w[5], w[2], w[3]);
+      }
+      printf("\n");
       for (uint32_t i = 0; i < o.count; i++) {
         const uint8_t *p = o.data[i];
         const uint32_t tcmd = (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
