@@ -45,8 +45,11 @@
 /* NAS Get Serving System: the serving system, and the network it is on. */
 #define CBN_TLV_SERVING_SYSTEM 0x01u
 #define CBN_TLV_CURRENT_PLMN 0x12u
-/* NAS Get Signal Info: the LTE signal strength. */
+/* NAS Get Signal Info: the LTE signal strength. The modem on this board answers the four-byte form (0x17,
+   RSRP then RSRQ), which is the one the UMI port parses first too (hakios.nas.c). */
 #define CBN_TLV_LTE_SIGNAL 0x14u
+#define CBN_TLV_LTE_SIGNAL_ALT 0x17u
+#define CBN_TLV_LTE_SIGNAL_2 0x18u
 /* NAS Get System Info: the LTE service status. */
 #define CBN_TLV_LTE_SERVICE_STATUS 0x14u
 
@@ -199,12 +202,21 @@ static inline int cbn_take_serving_system(struct cbn_radio *r, const uint8_t *sd
 }
 
 /* Takes the signal strength out of a NAS Get Signal Info answer.
- * The LTE signal strength is TLV 0x14 {RSSI, RSRQ, RSRP, SNR}, each a signed number, the RSRP and the SNR two
- * bytes little-endian. */
+ * The LTE signal strength is TLV 0x14 {RSSI, RSRQ, RSRP, SNR} on some builds and TLV 0x17 {RSRP, RSRQ} on this
+ * modem, which is the form the UMI port reads (hakios.nas.c: type 0x17, level = the first 16-bit word). The 0x18
+ * TLV is the second half the modem sends beside it. */
 static inline int cbn_take_signal(struct cbn_radio *r, const uint8_t *sdu, uint32_t n)
 {
     uint32_t len = 0;
-    const uint8_t *v = cbn_find_tlv(sdu, n, CBN_TLV_LTE_SIGNAL, &len);
+    const uint8_t *v = cbn_find_tlv(sdu, n, CBN_TLV_LTE_SIGNAL_ALT, &len);
+    if (v && len >= 2u) {
+        r->rsrp = (int16_t)(v[0] | v[1] << 8);
+        r->rsrq = len >= 4u ? (int16_t)(v[2] | v[3] << 8) : 0;
+        r->rssi = (int8_t)(r->rsrp);
+        r->have_signal = 1;
+        return 1;
+    }
+    v = cbn_find_tlv(sdu, n, CBN_TLV_LTE_SIGNAL, &len);
     if (!v || len < 6u) return 0;
     r->rssi = (int8_t)v[0];
     r->rsrq = (int8_t)v[1];

@@ -1943,6 +1943,17 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
       }
     }
   }
+  /* Diagnostic: the answers the host's own NAS clients get, so the log says whether the registration it can
+     see is the modem's registration. */
+  if (r.kind == CBQ_TO_HOST && r.channel != CBQ_INTERNAL && r.service == CBN_SVC_NAS) {
+    static uint32_t nas_answers;
+    if (nas_answers < 16u) {
+      const uint8_t *sdu = static_cast<const uint8_t *>(body);
+      const uint32_t m = size >= 7u ? (uint32_t)(sdu[3] | sdu[4] << 8) : 0xffffu;
+      nas_answers++;
+      printf("COACHZ nas-answer: msg 0x%x cid %u len %u (%u)\n", m, (unsigned)r.cid, size, nas_answers);
+    }
+  }
   if (r.kind == CBQ_TO_HOST && r.channel == CBQ_INTERNAL) {
     bb_trace("int-rx", 0, r.service, r.cid, static_cast<const uint8_t *>(body), size);
     if (bb_ssctl_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_ssctl_slot &&
