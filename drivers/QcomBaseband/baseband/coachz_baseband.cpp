@@ -864,14 +864,16 @@ static void bb_nas_indicate(uint32_t msg, const uint8_t *sdu, uint32_t size)
     at += 3u + l;
   }
   ind[len_at] = (uint8_t)((n - 7u) & 0xffu); ind[len_at + 1] = (uint8_t)((n - 7u) >> 8);
-  uint32_t sent = 0;
+  uint32_t sent = 0, hosts = 0, dropped = 0;
   for (uint32_t i = 0; i < CBQ_MAX_CLIENTS; i++) {
     const struct cbq_client *c = &bb_qmux.client[i];
     if (!c->used || c->service != CBN_SVC_NAS || c->channel == CBQ_INTERNAL) continue;
+    ++hosts;
     const struct cbq_result r = cbq_from_modem(&bb_qmux, CBQ_PORT_BASE + i, 0, ind, n, bb_out, sizeof bb_out);
     if (r.kind == CBQ_TO_HOST && r.len) { bb_push(r.channel ? CBH_QMUX2 : CBH_QMUX1, bb_out, r.len); ++sent; }
+    else ++dropped;
   }
-  if (sent) printf("COACHZ nas-indicate: message 0x%x delivered to %u host NAS clients\n", msg, sent);
+  printf("COACHZ nas-indicate: message 0x%x: %u host NAS clients, %u sent, %u refused\n", msg, hosts, sent, dropped);
 }
 
 /* ---- registration: what the UMI port does and this bridge did not ----------------------------------
