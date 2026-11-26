@@ -396,6 +396,19 @@ static void bb_dms2e_note(const char *stage, uint32_t local_port, const uint8_t 
 // A QMI message for the modem, sent by the Wi-Fi thread from coachz_baseband_poll.
 static void bb_queue_tx(uint32_t local_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len)
 {
+  /* Diagnostic: the first frames the host sends to NAS, so the log says whether CommCenter drives the NAS
+     client it created. A host that never sends one cannot be shown the registration any other way. */
+  {
+    static uint32_t seen;
+    const uint32_t slot = local_port >= CBQ_PORT_BASE ? local_port - CBQ_PORT_BASE : ~0u;
+    if (seen < 12u && slot < CBQ_MAX_CLIENTS && bb_qmux.client[slot].used &&
+        bb_qmux.client[slot].service == CBN_SVC_NAS && !bb_qmux.client[slot].private_service) {
+      const uint32_t m = len >= 7u ? (uint32_t)(data[3] | data[4] << 8) : 0xffffu;
+      seen++;
+      printf("COACHZ nas-host: msg 0x%x cid %u len %u channel %u (%u)\n", m, bb_qmux.client[slot].cid, len,
+             bb_qmux.client[slot].channel, seen);
+    }
+  }
   uint8_t *copy = len ? static_cast<uint8_t *>(IOMallocData(len)) : nullptr;
   /* >= rather than ==: a count that has ever passed the limit must keep refusing instead of wrapping the ring
      and overwriting the frames already queued. */
@@ -1981,8 +1994,10 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
           printf("COACHZ register: the serving system answer: error %u\n", bb_reg.error);
           bb_radio_log();
         } else if (m == CBN_NAS_GET_SIGNAL_INFO) {
-          cbn_take_signal(&bb_radio, sdu, size);
-          printf("COACHZ register: the signal answer: error %u\n", bb_reg.error);
+          const int got = cbn_take_signal(&bb_radio, sdu, size);
+          printf("COACHZ register: the signal answer: error %u, %u TLVs, decoded %d\n", bb_reg.error, bb_reg.tlv_count, got);
+          for (uint32_t q = 0; q < bb_reg.tlv_count && q < 16u; q++)
+            printf("COACHZ register: signal TLV type 0x%02x of %u bytes\n", bb_reg.tlv_types[q], bb_reg.tlv_lens[q]);
           bb_radio_log();
         } else {
           printf("COACHZ register: answer message 0x%x: error %u, %u TLVs\n", m, bb_reg.error, bb_reg.tlv_count);
