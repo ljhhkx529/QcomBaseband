@@ -792,7 +792,7 @@ static void bb_radio_ask(struct cbn_probe *probe, int *slot, uint32_t service, u
    says once it is ready: signal strength and the serving system's registration state. */
 static void bb_radio_again(void)
 {
-  if (bb_radio_tries >= 4) return;
+  if (bb_radio_tries >= 60) return;
   const uint32_t now = bb_now_ms();
   if (bb_radio_next && now < (uint32_t)bb_radio_next) return;
   const struct cbq_server *nas = cbq_server_find(&bb_qmux, CBN_SVC_NAS);
@@ -800,6 +800,16 @@ static void bb_radio_again(void)
   ++bb_radio_tries;
   bb_radio_next = (int)(now + 10000u);
   uint8_t sdu[32];
+  /* The operating mode is re-asked too: the first ask can arrive before the modem's DMS answers (error 74),
+     and the mode the host has just set is only visible in a later answer. A fresh transaction each time keeps
+     the boot handshake's answers (txn 0x4c0x) apart from these. */
+  {
+    const struct cbq_server *dms = cbq_server_find(&bb_qmux, CBN_SVC_DMS);
+    if (dms && bb_dms_slot >= 0) {
+      const uint32_t m = cbn_build_request(sdu, sizeof sdu, 0x70u + (uint32_t)bb_radio_tries, CBN_DMS_GET_OPERATING_MODE);
+      if (m) bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_dms_slot, dms->node, dms->port, sdu, m);
+    }
+  }
   uint32_t n = cbn_build_request(sdu, sizeof sdu, 0x60u + (uint32_t)bb_radio_tries, CBN_NAS_GET_SIGNAL_INFO);
   if (n && bb_signal_slot >= 0)
     bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_signal_slot, nas->node, nas->port, sdu, n);
