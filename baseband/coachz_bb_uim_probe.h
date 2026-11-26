@@ -54,8 +54,10 @@ static inline uint32_t cbp_build_request(uint8_t *sdu, uint32_t room, uint32_t t
     return 7u;
 }
 
-/* Power On (0x30): TLV 0x01 {u8 slot}, the standard step that makes the card readable. */
-#define CBP_UIM_POWER_ON 0x0030u
+/* Power Off SIM (0x30) and Power On SIM (0x31): TLV 0x01 {u8 slot}. The earlier run sent 0x30 and the
+   card went absent, which is Power Off's result, so the pair is Off then On. */
+#define CBP_UIM_POWER_OFF 0x0030u
+#define CBP_UIM_POWER_ON 0x0031u
 static inline uint32_t cbp_build_tlv(uint8_t *sdu, uint32_t room, uint32_t txn, uint32_t message,
                                      uint8_t type, const uint8_t *value, uint32_t value_len)
 {
@@ -96,28 +98,62 @@ static inline uint32_t cbp_build_read(uint8_t *sdu, uint32_t room, uint32_t txn,
     return at;
 }
 
-/* Change Provisioning Session (0x38): TLV 0x01 {u8 session_type, u16 session_id} and
-   TLV 0x10 {u8 slot, u8 aid_len, u8 aid[]} (libqmi uim-service: Change Provisioning Session). */
+/* Change Provisioning Session (0x38), as libqmi defines it (data/qmi-service-uim.json, since 1.24):
+     TLV 0x01 Session Change   { u8 session_type, u8 activate }
+     TLV 0x10 Application Information { u8 slot, u8 aid_len, u8 aid[] }
+   The earlier attempt sent TLV 0x01 as { type, u16 id } with activate 0 and the wrong blob as the AID; the
+   modem refused it (result 1, error 1). */
 #define CBP_UIM_CHANGE_SESSION 0x0038u
 #define CBP_UIM_SESSION_PRIMARY_GW 0u
-static inline uint32_t cbp_build_session(uint8_t *sdu, uint32_t room, uint32_t txn, uint32_t message,
-                                         uint8_t session_type, uint16_t session_id,
-                                         uint8_t slot, const uint8_t *aid, uint8_t aid_len)
+static inline uint32_t cbp_build_session(uint8_t *sdu, uint32_t room, uint32_t txn, uint32_t session_type,
+                                         uint8_t activate, uint8_t slot, const uint8_t *aid, uint8_t aid_len)
 {
-    const uint32_t t1 = 3u + 3u;                 /* session change */
+    const uint32_t t1 = 3u + 2u;                 /* session change */
     const uint32_t t10 = 3u + 2u + aid_len;      /* application information */
     if (aid_len == 0u || room < 7u + t1 + t10) return 0;
     sdu[0] = 0x00u; sdu[1] = (uint8_t)txn; sdu[2] = 0x00u;
-    sdu[3] = (uint8_t)message; sdu[4] = (uint8_t)(message >> 8);
+    sdu[3] = (uint8_t)CBP_UIM_CHANGE_SESSION; sdu[4] = (uint8_t)(CBP_UIM_CHANGE_SESSION >> 8);
     const uint32_t tl = t1 + t10;
     sdu[5] = (uint8_t)tl; sdu[6] = (uint8_t)(tl >> 8);
     uint32_t at = 7u;
-    sdu[at++] = 0x01u; sdu[at++] = 0x03u; sdu[at++] = 0x00u;
-    sdu[at++] = session_type; sdu[at++] = (uint8_t)session_id; sdu[at++] = (uint8_t)(session_id >> 8);
+    sdu[at++] = 0x01u; sdu[at++] = 0x02u; sdu[at++] = 0x00u;
+    sdu[at++] = (uint8_t)session_type; sdu[at++] = activate;
     sdu[at++] = 0x10u; sdu[at++] = (uint8_t)(2u + aid_len); sdu[at++] = 0x00u;
     sdu[at++] = slot; sdu[at++] = aid_len;
     for (uint32_t i = 0; i < aid_len; ++i) sdu[at++] = aid[i];
     return at;
+}
+
+/* The USIM application's AID out of a Card Status value (TLV 0x10, libqmi "UIM Card Status"):
+     4 u16 indexes, u8 card count, per card: 5 bytes + u8 app count,
+     per app: u8 type, u8 state, u8 personalization state/feature/retries/unblock retries,
+              u8 aid_len, aid[aid_len], 7 more bytes.
+   Returns 1 and fills app_state/aid when the first card carries a USIM (type 2) application. */
+static inline int cbp_card_usim_aid(const uint8_t *v, uint32_t len, uint32_t *cards, uint32_t *app_state,
+                                    uint8_t *aid, uint32_t *aid_len)
+{
+    if (!v || len < 10u) return 0;
+    *cards = v[8];
+    uint32_t at = 9u;
+    for (uint32_t c = 0; c < *cards && at + 6u <= len; ++c) {
+        const uint32_t apps = v[at + 5];
+        at += 6u;
+        for (uint32_t a = 0; a < apps && at + 6u <= len; ++a) {
+            const uint32_t type = v[at];
+            const uint32_t state = v[at + 1];
+            if (at + 8u > len) return 0;
+            const uint32_t n = v[at + 6u];
+            if (at + 7u + n + 7u > len) return 0;
+            if (type == 2u && !*aid_len) {
+                *app_state = state;
+                *aid_len = n;
+                for (uint32_t i = 0; i < n; ++i) aid[i] = v[at + 7u + i];
+                return 1;
+            }
+            at += 7u + n + 7u;
+        }
+    }
+    return 0;
 }
 
 /* Reads the answer: the result and the list of TLVs the answer carried. Returns 1 when the answer was a response.
