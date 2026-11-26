@@ -83,6 +83,11 @@ static uint32_t bb_endpoint_fixes, bb_activations;
 static uint8_t bb_fix[2048];
 static struct cbe bb_esim;
 static int bb_esim_slot = -1;
+/* The eSIM branch is opt-in. The fuxi has a physical SIM in the slot and its modem has no VINYL service; the
+   eSIM state machine then fails its route, and the branch's fallback answered the host's UIM requests with an
+   internal error instead of the card's state. That is the wrong branch for this device: with coachz-esim unset
+   the UIM traffic goes to the modem untouched, card status included. */
+static int bb_esim_enabled;
 static bb_tx bb_uim_held[BB_TX];
 static uint32_t bb_uim_head, bb_uim_count;
 static uint8_t bb_uim_cid[BB_TX];
@@ -596,12 +601,12 @@ static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
 {
   if (r.service == CBD_SVC_WDS) bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
   bb_sim_request(r, sdu);
-  if (r.service == CBE_SVC_UIM && bb_esim.route_failed) {
+  if (bb_esim_enabled && r.service == CBE_SVC_UIM && bb_esim.route_failed) {
     const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, CBE_ERR_INTERNAL, nullptr, 0, bb_out, sizeof bb_out);
     if (n) bb_push(r.channel ? CBH_QMUX2 : CBH_QMUX1, bb_out, n);
     return;
   }
-  if (r.service == CBE_SVC_UIM && bb_esim_in && bb_esim_resp &&
+  if (bb_esim_enabled && r.service == CBE_SVC_UIM && bb_esim_in && bb_esim_resp &&
       (bb_esim.freeze || (!bb_esim.slots.known && r.len >= 7 && cbd_rd16(sdu + 3) == CBE_UIM_GET_CARD_STATUS))) {
     uint8_t *copy = bb_uim_count < BB_TX ? static_cast<uint8_t *>(IOMallocData(r.len)) : nullptr;
     if (copy) {
@@ -941,7 +946,7 @@ static void bb_radio_log(void)
 // Only explicit VINYL commands may switch slots or send an APDU. Idle discovery reads slot status.
 static void bb_esim_step(void)
 {
-  if (!bb_esim_in || !bb_esim_resp) return;
+  if (!bb_esim_enabled || !bb_esim_in || !bb_esim_resp) return;
   const struct cbq_server *server = cbq_server_find(&bb_qmux, CBE_SVC_UIM);
   if (!server) return;
   if (bb_esim_slot < 0) bb_esim_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, CBE_SVC_UIM);
@@ -1796,6 +1801,10 @@ extern "C" void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32
   {
     uint32_t once = 0;
     if (PE_parse_boot_argn("sheng-bb-lpm", &once, sizeof once) && once) bb_lpm_once = 1;
+    uint32_t esim = 0;
+    if (PE_parse_boot_argn("coachz-esim", &esim, sizeof esim) && esim) bb_esim_enabled = 1;
+    printf("COACHZ baseband: the eSIM branch is %s (boot-arg coachz-esim%s)\n",
+           bb_esim_enabled ? "on" : "off, UIM passes through to the modem", bb_esim_enabled ? "" : " unset");
   }
   IOService *provider = IOService::getResourceService();
   int made = 0;
@@ -2045,13 +2054,13 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
     if (r.service == CBD_SVC_WDS) bb_pdp_note(dst_port, r.cid, r.channel, static_cast<const uint8_t *>(body), size);
     // A temporary eUICC card-status indication is not the restored logical SIM.
     const uint8_t *sdu = static_cast<const uint8_t *>(body);
-    if (bb_esim.freeze && r.service == CBE_SVC_UIM && size >= 7 &&
+    if (bb_esim_enabled && bb_esim.freeze && r.service == CBE_SVC_UIM && size >= 7 &&
         sdu[0] == CBQ_QMI_INDICATION && cbd_rd16(sdu + 3) == 0x32u) {
       IOLockUnlock(bb_lock);
       return 1;
     }
-    const uint32_t fixed = cbe_card_status_fix(&bb_esim, r.service,
-      static_cast<const uint8_t *>(body), size, bb_fix, sizeof bb_fix);
+    const uint32_t fixed = bb_esim_enabled ? cbe_card_status_fix(&bb_esim, r.service,
+      static_cast<const uint8_t *>(body), size, bb_fix, sizeof bb_fix) : 0;
     if (fixed) {
       cbq_frame_header(bb_out, fixed, r.service, r.cid);
       memcpy(bb_out + CBQ_HDR, bb_fix, fixed);
