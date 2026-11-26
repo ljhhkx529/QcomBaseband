@@ -1959,7 +1959,10 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
 extern "C" void coachz_baseband_poll(void)
 {
   if (!bb_lock || !bb_send) return;
-  bb_tx batch[BB_TX];
+  /* The pass covers the whole queue, so a destination held at its credit watermark cannot starve the frames
+     behind it. Both arrays live in static storage: the poll runs on the Wi-Fi thread, whose stack cannot hold
+     two 256-entry copies (the first attempt overflowed the kernel stack). */
+  static bb_tx batch[BB_TX];
   uint32_t n = 0, released[16], r = 0, port;
   IOLockLock(bb_lock);
   bb_ssctl_step();
@@ -1985,7 +1988,7 @@ extern "C" void coachz_baseband_poll(void)
      keeps trying the rest; every skipped frame of a blocked destination stays behind the refused one, which keeps
      that destination's FIFO order, and all the kept frames go back in front of the queue in their original order. */
   struct { uint32_t node, port; } blocked[8];
-  bb_tx kept[BB_TX];
+  static bb_tx kept[BB_TX];
   uint32_t blocked_n = 0, kept_n = 0;
   for (uint32_t i = 0; i < n; i++) {
     bool skip = false;
