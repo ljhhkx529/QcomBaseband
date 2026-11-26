@@ -98,6 +98,12 @@ static int bb_ssctl_slot = -1;
 // speaks when a client asks it to, and a physical card is not that: reading card slot one is one request.
 static struct cbp_uim bb_uim;
 static int bb_uim_slot = -1;
+static int bb_session_sent;
+static int bb_uim_poll_at;      /* next poll, ms */
+static int bb_uim_poll_count;   /* polls sent */
+static int bb_uim_ready;        /* an answer has said app 7 */
+static void bb_queue_tx(uint32_t local_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len);
+static void bb_queue_tx(uint32_t local_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len);
 
 // The radio, asked for over DMS and NAS (coachz_bb_nas_probe.h). Three read-only requests: whether the radio is
 // on, whether it has registered, and how strong the signal is. Nothing else asks them: the bridge forwards what
@@ -185,6 +191,52 @@ static void bb_trace(const char *dir, uint32_t channel, uint32_t service, uint32
 {
   if (!service || n < 7u) return;   // CTL has its own SDU layout and its own lines
   const uint32_t type = sdu[0], txn = cbd_rd16(sdu + 1), message = cbd_rd16(sdu + 3);
+  /* Baseband probe: every message of the services that carry the card, the radio state and the activation, raw. */
+  if (service == 0x2u || service == 0x3u || service == 0xbu || service == 0xe2u) {
+    printf("COACHZ sdu: %s svc 0x%x cid %u type %u msg 0x%x txn %u len %u hex", dir, service, cid, type, message, txn, n);
+    for (uint32_t i = 0; i < n && i < 160u; ++i) printf(" %02x", sdu[i]);
+    printf("\n");
+  }
+  /* UIM card status indication: when the slot's USIM application is detected (state 1) but not ready (7),
+     bind it to the primary GW session. Apple firmware does this itself; this modem leaves the application at
+     DETECTED until the host asks (QMI UIM Change Provisioning Session 0x38). */
+  if (service == 0xbu && message == 0x32u && type == 4u && bb_uim_slot >= 0 && !bb_session_sent) {
+    uint32_t l10 = 0, l14 = 0;
+    const uint8_t *v10 = cbd_find(sdu, n, 0x10, &l10);
+    const uint8_t *a14 = cbd_find(sdu, n, 0x14, &l14);
+    const uint32_t app_state = (v10 && l10 >= 17u && v10[14]) ? v10[16] : 0u;
+    if (app_state != 7u && a14 && l14 >= 2u) {
+      const struct cbq_server *srv = cbq_server_find(&bb_qmux, CBE_SVC_UIM);
+      uint8_t rsdu[64];
+      const uint32_t m = srv ? cbp_build_session(rsdu, sizeof rsdu, 0x50u, CBP_UIM_CHANGE_SESSION,
+                                                 CBP_UIM_SESSION_PRIMARY_GW, 0u, 1u, a14 + 1, (uint8_t)(l14 - 1u)) : 0u;
+      if (m) {
+        bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_uim_slot, srv->node, srv->port, rsdu, m);
+        bb_session_sent = 1;
+        printf("COACHZ uim: session change sent, app_state %u, aid %u bytes, t %u\n",
+               app_state, l14 - 1u, bb_now_ms());
+      }
+    }
+  }
+  /* DMS operating mode: the request's mode value and the answer's result/error, one line each and outside the
+     dedup and the budget below. The mode is what says whether the upper layer asks for online (0) or low power
+     (1); the answer's error says whether the modem took it. The direction string separates the bridge's own
+     client (int) from ABM's (host/to-host). */
+  if (service == 0x2u && (message == 0x2du || message == 0x2eu)) {
+    if (type == 0u) {
+      uint32_t mode_len = 0;
+      const uint8_t *mode = message == 0x2eu ? cbd_find(sdu, n, 0x01, &mode_len) : nullptr;
+      printf("COACHZ dms: %s cid %u msg 0x%x request mode %d t %u\n", dir, cid, message,
+             mode && mode_len >= 1u ? (int)mode[0] : -1, bb_now_ms());
+    } else if (type == 2u) {
+      uint32_t result = 0xffffu, error = 0xffffu, rlen = 0;
+      if (cbd_sdu_ok(sdu, n)) {
+        const uint8_t *r = cbd_find(sdu, n, 0x02, &rlen);
+        if (r && rlen >= 4u) { result = cbd_rd16(r); error = cbd_rd16(r + 2); }
+      }
+      printf("COACHZ dms: %s cid %u msg 0x%x answer result %u err 0x%x t %u\n", dir, cid, message, result, error, bb_now_ms());
+    }
+  }
   const uint32_t error = type == 2u ? (cbd_sdu_ok(sdu, n) ? cbd_error(sdu, n) : 0xfffeu) : 0u;
   const uint64_t key = 1u + ((uint64_t)((uint32_t)dir[0] << 8 | (uint32_t)dir[4]) << 48 |(uint64_t)service << 40 | (uint64_t)type << 32 |
     (uint64_t)message << 16 | error);
@@ -202,9 +254,29 @@ static void bb_trace(const char *dir, uint32_t channel, uint32_t service, uint32
   printf("COACHZ qmi: %s ch %u svc 0x%x cid %u type %u msg 0x%x txn %u len %u err 0x%x n %u t %u\n",
          dir, channel, service, cid, type, message, txn, n, error, count, bb_now_ms());
 }
+/* Service 0 (CTL) travels in two different header layouts: cbq_ctl reads the host side as flags, txn, message
+   id (2..3), TLV length (4..5), while cbq_from_modem reads the modem side with the generic QMI layout (length at
+   5..6). The raw bytes and the two fields below settle which layout the modem actually uses. */
+static void bb_ctl_note(const char *dir, uint32_t channel, const uint8_t *s, uint32_t n)
+{
+  char hex[3u * 16u + 1u];
+  const uint32_t take = n < 16u ? n : 16u;
+  for (uint32_t i = 0; i < take; i++) {
+    static const char digits[] = "0123456789abcdef";
+    hex[i * 3u + 0u] = digits[s[i] >> 4];
+    hex[i * 3u + 1u] = digits[s[i] & 15u];
+    hex[i * 3u + 2u] = ' ';
+  }
+  hex[take * 3u] = '\0';
+  printf("COACHZ ctl: %s ch %u txn %u msg 0x%x tlvlen %u len %u hex %s\n", dir, channel,
+         n >= 2u ? (uint32_t)s[1] : 0u, n >= 4u ? (uint32_t)(s[2] | s[3] << 8) : 0xffffu,
+         n >= 6u ? (uint32_t)(s[4] | s[5] << 8) : 0xffffu, n, hex);
+}
+
 // A QMUX frame (I/F type 1, length, flags, service, client id, then the SDU).
 static void bb_trace_frame(const char *dir, uint32_t channel, const uint8_t *frame, uint32_t len)
 {
+  if (len >= CBQ_HDR + 2u && frame[0] == 1u && frame[4] == 0u) bb_ctl_note(dir, channel, frame + CBQ_HDR, len - CBQ_HDR);
   if (len >= CBQ_HDR + 7u && frame[0] == 1u) bb_trace(dir, channel, frame[4], frame[5], frame + CBQ_HDR, len - CBQ_HDR);
 }
 
@@ -247,20 +319,102 @@ static void bb_flush(uint32_t channel)
   for (bb_frame f = bb_pop(channel); f.data; f = bb_pop(channel)) IOFreeData(f.data, f.len);
 }
 
+/* Where the bridge's own transmissions are lost. The queue holds 64 frames, the poll drains at most 16 per pass and
+   puts a refused send back only when there is room, so a busy pass can lose frames in two places. One line per
+   (service, message) at the first drop and at each power of two keeps the Wi-Fi thread from printing a flood while
+   still naming the traffic that goes missing: the DMS mode request is the one the upper layer notices as a baseband
+   that never comes online. */
+static void bb_tx_drop_note(const char *where, uint32_t local_port, const uint8_t *data, uint32_t len)
+{
+  struct { uint32_t key, count; } static seen[32];
+  const uint32_t slot = local_port >= CBQ_PORT_BASE ? local_port - CBQ_PORT_BASE : ~0u;
+  const uint32_t svc = slot < CBQ_MAX_CLIENTS && bb_qmux.client[slot].used ? bb_qmux.client[slot].service : 0xffffu;
+  /* CTL (service 0) packs its message id at 2..3 (flags, transaction, id, TLV length); every other QMI service
+     at 3..4 (type, transaction, id, length). Reading the generic offset for CTL reports msg_hi | tlv_lo, which names
+     message ids that do not exist. */
+  const uint32_t msg = svc == 0u ? (len >= 6u ? (uint32_t)data[2] | (uint32_t)data[3] << 8 : 0xffffu)
+                                 : (len >= 7u ? (uint32_t)data[3] | (uint32_t)data[4] << 8 : 0xffffu);
+  const uint32_t key = (svc << 16) | msg;
+  bb_tx_dropped++;
+  for (uint32_t i = 0; i < 32u; i++) {
+    if (seen[i].key != key && seen[i].key) continue;
+    seen[i].key = key;
+    const uint32_t n = ++seen[i].count;
+    if (n == 1u || (n & (n - 1u)) == 0u)
+      printf("COACHZ txdrop: %s svc 0x%x msg 0x%x (%u, total %u)\n", where, svc, msg, n, bb_tx_dropped);
+    return;
+  }
+}
+
+/* One line per stage of a DMS Set Operating Mode (service 0x02, message 0x2e): the request the upper layer
+   sends, whether the poll sends it or the link refuses it, whether it goes back on the queue, and whether the
+   modem answers it. The same cid and transaction identify the four lines of one attempt. */
+static void bb_dms2e_note(const char *stage, uint32_t local_port, const uint8_t *sdu, uint32_t n, int rc)
+{
+  const uint32_t slot = local_port >= CBQ_PORT_BASE ? local_port - CBQ_PORT_BASE : ~0u;
+  const bool used = slot < CBQ_MAX_CLIENTS && bb_qmux.client[slot].used;
+  const uint32_t svc = used ? bb_qmux.client[slot].service : 0xffffu;
+  const uint32_t msg = n >= 7u ? (uint32_t)(sdu[3] | sdu[4] << 8) : 0xffffu;
+  if (svc != 0x2u || (msg != 0x2du && msg != 0x2eu)) return;
+  /* One request is identified by its client id and transaction; the refusal loop of run-20261125-081201 printed
+     the same pair a million times. The first two lines and each power of two keep the count visible without the
+     flood, and the counter itself says how often the stage ran. */
+  struct { uint32_t key, count; } static seen[16];
+  const uint32_t cid = used ? (uint32_t)bb_qmux.client[slot].cid : 0xffffu;
+  const uint32_t txn = n >= 7u ? (uint32_t)(sdu[1] | sdu[2] << 8) : 0xffffu;
+  const uint32_t key = cid * 0x10000u + (txn & 0xffffu);
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < 16u; i++) {
+    if (seen[i].key != key && seen[i].key) continue;
+    seen[i].key = key;
+    count = ++seen[i].count;
+    break;
+  }
+  if (count > 2u && (count & (count - 1u))) return;
+  /* The channel says whether the request came from the bridge (internal) or from ABM; the full SDU is printed on
+     the lines that survive the limit, which is what tells an identical request from one a step apart. */
+  char hex[3u * 32u + 1u];
+  const uint32_t take = n < 32u ? n : 32u;
+  for (uint32_t i = 0; i < take; i++) {
+    static const char digits[] = "0123456789abcdef";
+    hex[i * 3u + 0u] = digits[sdu[i] >> 4];
+    hex[i * 3u + 1u] = digits[sdu[i] & 15u];
+    hex[i * 3u + 2u] = ' ';
+  }
+  hex[take * 3u] = '\0';
+  printf("COACHZ dmsmode: %s ch %u svc 0x2 cid %u txn %u msg 0x%x len %u rc %d queue %u count %u hex %s t %u\n",
+         stage, used ? (unsigned)bb_qmux.client[slot].channel : 0xffffu, cid, txn, msg, n, rc, bb_tx_count,
+         count, hex, bb_now_ms());
+}
+
 // A QMI message for the modem, sent by the Wi-Fi thread from coachz_baseband_poll.
 static void bb_queue_tx(uint32_t local_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len)
 {
   uint8_t *copy = len ? static_cast<uint8_t *>(IOMallocData(len)) : nullptr;
-  if (!copy || bb_tx_count == BB_TX) {
+  /* >= rather than ==: a count that has ever passed the limit must keep refusing instead of wrapping the ring
+     and overwriting the frames already queued. */
+  if (!copy || bb_tx_count >= BB_TX) {
     if (copy) IOFreeData(copy, len);
-    bb_tx_dropped++;
+    bb_dms2e_note("enq-drop", local_port, data, len, -1);
+    bb_tx_drop_note(bb_tx_count >= BB_TX ? "queue full" : "no memory", local_port, data, len);
     return;
   }
   memcpy(copy, data, len);
   bb_txq[(bb_tx_head + bb_tx_count++) % BB_TX] = { local_port, node, port, len, copy };
+  bb_dms2e_note("enqueue", local_port, data, len, 0);
   const uint32_t slot = local_port - CBQ_PORT_BASE;
-  if (slot < CBQ_MAX_CLIENTS && bb_qmux.client[slot].used && bb_qmux.client[slot].channel == CBQ_INTERNAL)
+  if (slot < CBQ_MAX_CLIENTS && bb_qmux.client[slot].used && bb_qmux.client[slot].channel == CBQ_INTERNAL) {
     bb_trace("int-tx", 0, bb_qmux.client[slot].service, bb_qmux.client[slot].cid, data, len);
+  } else if (slot < CBQ_MAX_CLIENTS && bb_qmux.client[slot].used) {
+    /* The fourth state is a request from the upper layer's own QMI client (the QMUX channel), not one of the
+       bridge's internal probes: those are traced above and reach the modem whatever CommCenter is doing. */
+    static bool stage4_logged;
+    if (!stage4_logged) {
+      stage4_logged = true;
+      printf("FUXI_STAGE 4/4 commcenter: the first QMI request from the upper layer reached the modem (service 0x%02x)\n",
+             bb_qmux.client[slot].service);
+    }
+  }
 }
 
 // BBUEUR13Loader pushes the SBL with SendImage on pbl, frees that transport, opens sahara and waits 40 s for the loaded SBL's HELLO there. So the
@@ -324,12 +478,25 @@ static int bb_lpm_answer(uint32_t dst_port, const uint8_t *sdu, uint32_t n)
 static void bb_sahara_restart(void)
 {
   struct cbs_out o;
+  /* The only caller is the sahara channel's open with a boot image sent, so this line answers one question:
+     does the upper layer re-open the channel right after the last DONE_RESP? The state and the image index
+     below are the ones the state machine had at that moment, before cbs_init resets them. */
+  printf("COACHZ baseband: sahara restart on channel open: state %u, image %u of %u, last command %u, %u requests\n",
+         bb_sahara.state, bb_sahara.image_index + 1u, bb_sahara.image_count, bb_sahara.last_command, bb_sahara.requests);
   bb_flush(CBH_SAHARA);
   cbs_init(&bb_sahara, bb_sahara_images, sizeof bb_sahara_images / sizeof bb_sahara_images[0], 0x10000);
   cbs_start(&bb_sahara, &o);
   for (uint32_t i = 0; i < o.count; i++) bb_push(CBH_SAHARA, o.data[i], o.len[i]);
-  bb_lpm_pending = 1;
-  bb_lpm_step = 0;
+  /* The low-power handshake belongs to the modem's own boot: the first sahara channel open after the modem
+     starts. Every later open is ABM re-opening the channel for another boot attempt, and repeating the
+     handshake there set the modem back to low power after ABM had already taken it online (DMS timeline:
+     online result 0 at t=80319, the bridge's mode 1 again at t=106344). */
+  static bool lpm_armed_once;
+  if (!lpm_armed_once) {
+    lpm_armed_once = true;
+    bb_lpm_pending = 1;
+    bb_lpm_step = 0;
+  }
   printf("COACHZ baseband: sahara hello\n");
 }
 
@@ -500,11 +667,51 @@ static void bb_uim_step(void)
   if (bb_uim_slot < 0) return;
   if (bb_uim.sent || bb_uim.answered) return;
   uint8_t sdu[32];
-  const uint32_t n = cbp_build_request(sdu, sizeof sdu, 0x23u, CBP_UIM_GET_SLOT_STATUS);
+  /* Read-only asks on the bridge's own UIM client, one boot: register the card events with the same mask the upper
+     layer uses, the card status, the slot status, and the two identity files (EF_ICCID 0x2fe2 and EF_IMSI 0x6f07).
+     Their answers are dumped raw by bb_trace; the identity files are also parsed by bb_sim_answer, so a card the
+     modem's database does not name can still be read and put into the activation indication. */
+  const uint32_t port = CBQ_PORT_BASE + (uint32_t)bb_uim_slot;
+  const uint32_t queued = bb_tx_count;
+  static const uint8_t path_iccid[] = { 0x3fu, 0x00u };
+  static const uint8_t path_imsi[] = { 0x3fu, 0x00u, 0x7fu, 0x20u };
+  static const uint8_t power_on_slot[] = { 0x01u };
+  uint32_t n;
+  /* Power On was tried and made the modem report the card absent, so it stays out. */
+  (void)power_on_slot;
+  if ((n = cbp_build_register(sdu, sizeof sdu, 0x40u)) != 0u)
+    bb_queue_tx(port, server->node, server->port, sdu, n);
+  if ((n = cbp_build_request(sdu, sizeof sdu, 0x41u, 0x2fu)) != 0u)
+    bb_queue_tx(port, server->node, server->port, sdu, n);
+  if ((n = cbp_build_request(sdu, sizeof sdu, 0x42u, CBP_UIM_GET_SLOT_STATUS)) != 0u)
+    bb_queue_tx(port, server->node, server->port, sdu, n);
+  /* The identity files are not read here: the reference bridge (UMi, umi_modem_qmi.h) only asks for the card
+     status and sniffs the upper layer's own ReadTransparent answers. The direct read got QMI error 0x11 because
+     the USIM application is still in state 1 (detected), not 7 (ready); leave the read to CommCenter. */
+  (void)path_iccid; (void)path_imsi;
+  if (bb_tx_count != queued) bb_uim.sent = 1;
+}
+
+/* UMi's UIM sequence (umi_modem_mhi.inc, md_stage "QMI-UIM"): ask Get Card Status again every couple of seconds
+   until the USIM application reports 7 (ready), because the application moves to ready some time after the slot
+   is detected. The bridge's first ask can come before that, so one ask is not enough. Read-only. */
+static void bb_uim_poll_step(void)
+{
+  if (bb_uim_ready) return;
+  if (bb_uim_poll_count >= 90) return;                       /* 180 s cap */
+  const struct cbq_server *server = cbq_server_find(&bb_qmux, CBP_SVC_UIM);
+  if (!server) return;
+  if (bb_uim_slot < 0) bb_uim_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, CBP_SVC_UIM);
+  if (bb_uim_slot < 0) return;
+  const uint32_t now = bb_now_ms();
+  if (bb_uim_poll_at && now < (uint32_t)bb_uim_poll_at) return;
+  bb_uim_poll_at = (int)(now + 2000u);
+  uint8_t sdu[32];
+  const uint32_t n = cbp_build_request(sdu, sizeof sdu, 0x60u + (uint32_t)bb_uim_poll_count, 0x2fu);
   if (!n) return;
   const uint32_t queued = bb_tx_count;
   bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_uim_slot, server->node, server->port, sdu, n);
-  if (bb_tx_count != queued) bb_uim.sent = 1;
+  if (bb_tx_count != queued) bb_uim_poll_count++;
 }
 
 // The modem's answer about the card, on the record.
@@ -672,11 +879,14 @@ static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu)
   if (r.service != CBD_SVC_UIM) return;
   const uint32_t file = cbd_uim_read_file(sdu, r.len);
   if (file != CBD_EF_ICCID && file != CBD_EF_IMSI) return;
+  printf("COACHZ sim: ReadTransparent EF 0x%04x cid %u txn %u (iccid_known %u imsi_known %u act_known %u)\n",
+         file, r.cid, (uint32_t)cbd_rd16(sdu + 1), bb_iccid_known, bb_imsi_known, bb_act_known);
   bb_sim_reads[bb_sim_next++ % 8] = { 1, r.channel, r.cid, cbd_rd16(sdu + 1), (uint16_t)file };
 }
 static void bb_sim_answer(const struct cbq_result &r, const uint8_t *sdu, uint32_t n)
 {
   if (r.service != CBD_SVC_UIM || n < 7u || sdu[0] != 2u || cbd_rd16(sdu + 3) != CBD_UIM_READ_TRANSPARENT) return;
+  printf("COACHZ sim: ReadTransparent answer cid %u txn %u len %u\n", r.cid, (uint32_t)cbd_rd16(sdu + 1), n);
   for (auto &q : bb_sim_reads) {
     if (!q.used || q.channel != r.channel || q.cid != r.cid || q.txn != cbd_rd16(sdu + 1)) continue;
     q.used = 0;
@@ -761,8 +971,19 @@ static void bb_host_write(uint32_t channel, const uint8_t *data, uint32_t len)
     const enum cbs_state before = bb_sahara.state;
     for (uint32_t at = 0; at < len && bb_sahara.state != CBS_FAILED;) {
       struct cbs_out o;
+      const enum cbs_state step = bb_sahara.state;
       const uint32_t used = cbs_receive(&bb_sahara, data + at, len - at, &o);
-      for (uint32_t i = 0; i < o.count; i++) bb_push(CBH_SAHARA, o.data[i], o.len[i]);
+      /* Which sahara command the upper layer sent and what the state machine answered: the boot end stalls
+         between HELLO, DONE and COMMAND_READY, and only the wire order shows which step is missing. */
+      const uint32_t cmd = len - at >= 4u ? (uint32_t)data[at] | (uint32_t)data[at + 1] << 8 | (uint32_t)data[at + 2] << 16 | (uint32_t)data[at + 3] << 24 : ~0u;
+      printf("COACHZ sahara: rx cmd 0x%x len %u, state %u -> %u, %u out\n", cmd, used, (unsigned)step, (unsigned)bb_sahara.state, o.count);
+      for (uint32_t i = 0; i < o.count; i++) {
+        const uint8_t *p = o.data[i];
+        const uint32_t tcmd = (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+        const uint32_t tlen = (uint32_t)p[4] | (uint32_t)p[5] << 8 | (uint32_t)p[6] << 16 | (uint32_t)p[7] << 24;
+        printf("COACHZ sahara: tx cmd 0x%x len %u\n", tcmd, tlen);
+        bb_push(CBH_SAHARA, o.data[i], o.len[i]);
+      }
       if (!used) break;
       at += used;
     }
@@ -1294,7 +1515,16 @@ public:
 };
 OSDefineMetaClassAndStructors(AppleBasebandUserClient, IOUserClient)
 
-class AppleBaseband : public IOService {
+/* The board class libTelephonyBaseband searches for: IOServiceMatching("baseband") resolves the name through
+ * OSMetaClass and matches a service whose class, or one of its ancestors, is that class (IOService.cpp:7625,
+ * OSMetaClass::checkMetaCastWithName). This empty superclass supplies that second name on the very same
+ * AppleBaseband object, so no extra service is published and every property and name stays where it is. */
+class baseband : public IOService {
+  OSDeclareDefaultStructors(baseband)
+};
+OSDefineMetaClassAndStructors(baseband, IOService)
+
+class AppleBaseband : public baseband {
   OSDeclareDefaultStructors(AppleBaseband)
 public:
   IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
@@ -1307,7 +1537,7 @@ public:
   }
   IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
 };
-OSDefineMetaClassAndStructors(AppleBaseband, IOService)
+OSDefineMetaClassAndStructors(AppleBaseband, baseband)
 
 #include "coachz_bb_pdp.cpp"
 
@@ -1441,6 +1671,9 @@ extern "C" void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32
   made += provider && bb_publish<AppleBasebandPCIMAVPDPManager>(provider);
   made += provider && bb_publish<AppleIPAppender>(provider);
   bb_published = 1;
+  /* The third state: the kernel side is in the registry, so a client can find it by name and open it. */
+  printf("FUXI_STAGE 3/4 ioregistry: AppleBaseband, AppleBasebandPCIControl and %u channel ports are registered\n",
+         (unsigned)CBH_PUBLISHED);
   printf("COACHZ baseband: %d of %u services published (AppleBaseband, AppleBasebandPCIControl, %u channels, the PDP manager, AppleIPAppender)\n", made, 4u + CBH_PUBLISHED, CBH_PUBLISHED);
 }
 
@@ -1462,6 +1695,29 @@ extern "C" void coachz_baseband_del_server(uint32_t service, uint32_t node, uint
   IOLockUnlock(bb_lock);
 }
 
+/* The modem to bridge side: a frame the routing cannot deliver never reaches the upper layer, and without a line
+   here it looks exactly like a modem that never answered. The DMS operating-mode answer is the one whose absence
+   keeps the radio offline, so it is named whatever the routing returned; drops of any other service are named once
+   per (service, message) so a flood of unmatched frames cannot bury the log. */
+static uint32_t bb_modem_dropped;
+static void bb_mdrop_note(uint32_t kind, uint32_t service, uint32_t msg, uint32_t cid, uint32_t len)
+{
+  struct { uint32_t key, count; } static seen[32];
+  const int always = service == 0x2u && (msg == 0x2du || msg == 0x2eu);
+  if (kind != CBQ_TO_HOST) bb_modem_dropped++;
+  if (!always && kind != CBQ_DROP) return;
+  const uint32_t key = kind << 24 | service << 16 | msg;
+  for (uint32_t i = 0; i < 32u; i++) {
+    if (seen[i].key != key && seen[i].key) continue;
+    seen[i].key = key;
+    const uint32_t n = ++seen[i].count;
+    if (n == 1u || (n & (n - 1u)) == 0u)
+      printf("COACHZ mdrop: kind %u svc 0x%x msg 0x%x cid %u len %u (%u, dropped %u)\n",
+             kind, service, msg, cid, len, n, bb_modem_dropped);
+    return;
+  }
+}
+
 // QRTR data for one of the bridge's client ports: 1 when the port is the bridge's.
 extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t, const void *body, uint32_t size)
 {
@@ -1469,6 +1725,89 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
   if (!bb_lock) return 1;
   IOLockLock(bb_lock);
   const struct cbq_result r = cbq_from_modem(&bb_qmux, dst_port, src_node, static_cast<const uint8_t *>(body), size, bb_out, sizeof bb_out);
+  {
+    const uint8_t *sdu = static_cast<const uint8_t *>(body);
+    const uint32_t slot = dst_port >= CBQ_PORT_BASE ? dst_port - CBQ_PORT_BASE : ~0u;
+    const bool used = slot < CBQ_MAX_CLIENTS && bb_qmux.client[slot].used;
+    /* A drop leaves the result's service field at zero (cbq_from_modem returns before assigning it), so the
+       service and the client id are read from the slot the destination port names. A free slot has nothing to
+       name them from, and that is itself the answer. */
+    const uint32_t svc = used ? (uint32_t)bb_qmux.client[slot].service : 0xffffu;
+    const uint32_t cid = used ? (uint32_t)bb_qmux.client[slot].cid : 0xffffu;
+    if (r.kind == CBQ_DROP) {
+      const char *why =
+          dst_port < CBQ_PORT_BASE ? "port below base"
+        : slot >= CBQ_MAX_CLIENTS ? "slot out of range"
+        : !used ? "client free"
+        : bb_qmux.client[slot].private_service ? "private client"
+        : size < CBQ_SDU_HDR ? "sdu short"
+        : (size >= 7u && CBQ_SDU_HDR + (uint32_t)(sdu[5] | sdu[6] << 8) > size) ? "length past end"
+        : !cbq_server_find(&bb_qmux, svc) ? "no server"
+        : "server node mismatch";
+      char hex[3u * 8u + 1u];
+      const uint32_t take = size < 8u ? size : 8u;
+      for (uint32_t i = 0; i < take; i++) {
+        static const char digits[] = "0123456789abcdef";
+        hex[i * 3u + 0u] = digits[sdu[i] >> 4];
+        hex[i * 3u + 1u] = digits[sdu[i] & 15u];
+        hex[i * 3u + 2u] = ' ';
+      }
+      hex[take * 3u] = '\0';
+      printf("COACHZ mdrop: drop node %u dst_port %u local %u slot %u used %u private %u svc 0x%x cid %u len %u why %s hex %s\n",
+             src_node, dst_port, r.local_port, slot, (unsigned)used,
+             used ? (unsigned)bb_qmux.client[slot].private_service : 0u, svc, cid, size, why, hex);
+    } else {
+      /* The service comes from the slot, not from the result: both hold the same value on the delivered path,
+         but only the slot's copy is meaningful when the result is still at its initializer. */
+      const uint32_t msg = size >= 7u ? (uint32_t)(sdu[3] | sdu[4] << 8) : 0xffffu;
+      bb_mdrop_note((uint32_t)r.kind, svc, msg, cid, size);
+      bb_dms2e_note("response", dst_port, sdu, size, 0);
+    }
+  }
+  /* The UIM answers CommCenter asks for itself (slot and card status): their bytes are what decides whether the
+     card looks ready, and the trace only carries the length. Diagnostic only. */
+  if (r.service == CBP_SVC_UIM && size >= 7u) {
+    const uint8_t *sdu = static_cast<const uint8_t *>(body);
+    const uint32_t m = (uint32_t)(sdu[3] | sdu[4] << 8);
+    const uint32_t type = sdu[0];
+    if (m == 0x2eu || m == 0x2fu || m == 0x30u || m == 0x20u || m == 0x32u || m == 0x47u || m == 0x48u) {
+      printf("COACHZ uim: %s msg 0x%x cid %u txn %u len %u bytes:",
+             type == 4u ? "indication" : "answer", m, r.cid,
+             (uint32_t)(sdu[1] | sdu[2] << 8), size);
+      for (uint32_t i = 0; i < size && i < 200u; i++) printf(" %02x", sdu[i]);
+      printf("\n");
+      /* TLV walk: raw type/length/value offsets, no semantic assumptions. */
+      const uint32_t end = 7u + (uint32_t)(sdu[5] | sdu[6] << 8);
+      for (uint32_t at = 7u; at + 3u <= end && at + 3u <= size;) {
+        const uint32_t t = sdu[at], l = (uint32_t)(sdu[at + 1] | sdu[at + 2] << 8);
+        printf("COACHZ uim:   tlv 0x%02x len %u at %u%s\n", t, l, at,
+               (at + 3u + l > end || at + 3u + l > size) ? " MALFORMED" : "");
+        if (at + 3u + l > end || at + 3u + l > size) break;
+        at += 3u + l;
+      }
+      if (m == 0x2fu) {
+        for (uint32_t at = 7u; at + 3u <= end && at + 3u <= size;) {
+          const uint32_t t = sdu[at], l = (uint32_t)(sdu[at + 1] | sdu[at + 2] << 8);
+          if (at + 3u + l > end || at + 3u + l > size) break;
+          if (t == 0x10u && l >= 11u) {
+            /* UMi's layout (umi_modem_qmi.h, umi3_apply_uim): v[8] slot count, v[9] slot 1 card state
+               (1 = inserted), v[14] application count, v[16] application 1 state (7 = ready). */
+            const uint8_t *v = sdu + at + 3;
+            const uint32_t slots = v[8], card = v[9];
+            const uint32_t apps = l >= 15u ? v[14] : 0u;
+            const uint32_t app_state = (l >= 17u && apps) ? v[16] : 0u;
+            if (m == 0x2fu && type == 2u && apps && app_state == 7u && !bb_uim_ready) {
+              bb_uim_ready = 1;
+              printf("COACHZ uim: app ready (7) seen, polls %d, t %u\n", bb_uim_poll_count, bb_now_ms());
+            }
+            printf("COACHZ uim:   card-status UMi: slots=%u card_state=%u inserted=%u apps=%u app1_state=%u (len %u)\n",
+                   slots, card, (slots != 0u && card == 1u) ? 1u : 0u, apps, app_state, l);
+          }
+          at += 3u + l;
+        }
+      }
+    }
+  }
   if (r.kind == CBQ_TO_HOST && r.channel == CBQ_INTERNAL) {
     bb_trace("int-rx", 0, r.service, r.cid, static_cast<const uint8_t *>(body), size);
     if (bb_ssctl_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_ssctl_slot &&
@@ -1567,6 +1906,7 @@ extern "C" void coachz_baseband_poll(void)
   IOLockLock(bb_lock);
   bb_ssctl_step();
   bb_uim_step();
+  bb_uim_poll_step();
   bb_radio_step();
   bb_esim_step();
   if (bb_lpm_pending == 1) { bb_lpm_pending = 2; bb_lpm_send(); }
@@ -1581,20 +1921,54 @@ extern "C" void coachz_baseband_poll(void)
      credit, and the credit comes back with a RESUME_TX. Dropping the request here would lose it with nothing on
      the log to say so. The queue is put back under the lock, in order, so the requests keep their order. */
   uint32_t refused = 0;
+  /* QRTR keeps one credit count per destination (node, port), so a destination that is out of credit says nothing
+     about the next frame for another destination. The pass therefore blocks only the destination that refused and
+     keeps trying the rest; every skipped frame of a blocked destination stays behind the refused one, which keeps
+     that destination's FIFO order, and all the kept frames go back in front of the queue in their original order. */
+  struct { uint32_t node, port; } blocked[8];
+  bb_tx kept[16];
+  uint32_t blocked_n = 0, kept_n = 0;
   for (uint32_t i = 0; i < n; i++) {
-    if (bb_send(batch[i].local_port, batch[i].node, batch[i].port, batch[i].data, batch[i].len) != 0) {
-      IOLockLock(bb_lock);
-      if (bb_tx_count < BB_TX) {
-        bb_txq[(bb_tx_head + bb_tx_count++) % BB_TX] = batch[i];
-        refused++;
-      } else {
-        IOFreeData(batch[i].data, batch[i].len);
-        bb_tx_dropped++;
-      }
-      IOLockUnlock(bb_lock);
-    } else {
-      IOFreeData(batch[i].data, batch[i].len);
+    bool skip = false;
+    for (uint32_t k = 0; k < blocked_n; k++)
+      if (blocked[k].node == batch[i].node && blocked[k].port == batch[i].port) skip = true;
+    if (skip) {
+      kept[kept_n++] = batch[i];
+      continue;
     }
+    const int sent_rc = bb_send(batch[i].local_port, batch[i].node, batch[i].port, batch[i].data, batch[i].len);
+    bb_dms2e_note(sent_rc == 0 ? "sent" : "refused", batch[i].local_port, batch[i].data, batch[i].len, sent_rc);
+    if (sent_rc == 0) {
+      IOFreeData(batch[i].data, batch[i].len);
+      continue;
+    }
+    if (blocked_n < 8u) {
+      blocked[blocked_n].node = batch[i].node;
+      blocked[blocked_n].port = batch[i].port;
+      blocked_n++;
+    }
+    kept[kept_n++] = batch[i];
+    refused++;
+  }
+  if (kept_n) {
+    /* The host enqueues while the batch is being sent: the poll releases the lock before bb_send, so the queue can
+       have filled again by now. Take the room that is left, in order, from the front of the kept frames and
+       prepend only that much; a frame that no longer fits is freed and counted as a drop, never written over a
+       live slot, and bb_tx_count never goes past BB_TX. */
+    IOLockLock(bb_lock);
+    const uint32_t room = BB_TX - bb_tx_count;
+    const uint32_t keep = kept_n < room ? kept_n : room;
+    for (uint32_t k = 0; k < keep; k++) {
+      const uint32_t pos = (bb_tx_head + BB_TX - keep + k) % BB_TX;
+      bb_txq[pos] = kept[k];
+    }
+    bb_tx_head = (bb_tx_head + BB_TX - keep) % BB_TX;
+    bb_tx_count += keep;
+    for (uint32_t k = keep; k < kept_n; k++) {
+      bb_tx_drop_note("prepend full", kept[k].local_port, kept[k].data, kept[k].len);
+      IOFreeData(kept[k].data, kept[k].len);
+    }
+    IOLockUnlock(bb_lock);
   }
   if (refused) {
     /* The poll runs as fast as the caller calls it, so a request that the link keeps refusing would print on

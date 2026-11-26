@@ -193,6 +193,8 @@ typedef struct {
     uint8_t hello_sent;
     /* The bridge has been published. It is published once, when the channel comes up. */
     uint8_t published;
+    /* The stage-2 line (the QRTR node is known and its handshake is done) is printed once. */
+    uint8_t stage2_logged;
     /* The service lookup has been sent. The modem answers it with the services it has. */
     uint8_t lookup_sent;
     /* How many of the named lookups went out. */
@@ -782,6 +784,19 @@ void fuxi_modem_poll(void)
         link->tx_retried++;
         const int again = qcom_glink_send(&link->glink, link->channel, link->tx_hold, link->tx_hold_length);
         if (again == QcomGlinkOk) {
+            /* The held packet carried the header of its send, confirm bit included: a retry that succeeds is the
+               send of that confirm, and it is the only place it can be reported. */
+            if (link->tx_hold_length >= 24u) {
+                const uint8_t *h = link->tx_hold;
+                const uint32_t confirm = (uint32_t)h[16] | (uint32_t)h[17] << 8 | (uint32_t)h[18] << 16 | (uint32_t)h[19] << 24;
+                if (confirm) {
+                    const uint32_t node = (uint32_t)h[24] | (uint32_t)h[25] << 8 | (uint32_t)h[26] << 16 | (uint32_t)h[27] << 24;
+                    const uint32_t port = (uint32_t)h[28] | (uint32_t)h[29] << 8 | (uint32_t)h[30] << 16 | (uint32_t)h[31] << 24;
+                    const uint32_t src = (uint32_t)h[2] | (uint32_t)h[3] << 8 | (uint32_t)h[4] << 16 | (uint32_t)h[5] << 24;
+                    printf("COACHZ qrtr_confirm: confirm_sent node %u port %u pending %u src %u matched 0\n", node, port,
+                           qrtr_flow_pending(&link->qrtr, node, port), src);
+                }
+            }
             link->tx_hold_valid = 0;
             link->tx_packets++;
             link->tx_resumed++;
@@ -800,6 +815,12 @@ tx_hold_done:;
      * It learns of the service only from the announcement, so an announcement that is not repeated on the
      * peer's next HELLO leaves the peer without it: the peer sends HELLO again whenever it (re)opens its
      * link, and answers it with the services it wants. */
+    /* The second state: the QRTR node is known and its HELLO handshake is done, so the AP can address the modem.
+       Printed once, on the first poll where both hold. */
+    if (link->ready && link->qrtr.remote_node_known && !link->stage2_logged) {
+        link->stage2_logged = 1;
+        printf("FUXI_STAGE 2/4 qrtr: the modem node is discovered and the IPC handshake is done\n");
+    }
     if (link->ready && link->qrtr.remote_node_known) {
         if (!link->locator_announced) {
             /* A refused announcement is tried again on the next poll: the link had no room, and the flag is
@@ -841,9 +862,10 @@ tx_hold_done:;
     /* The bridge is published once the channel is up. It has to be published after, not before: the bridge's clients
        are bound to the services the modem announces, and it needs this side's send hook to reach them. Until the
        channel is up there is no route to the modem at all, so a bridge published earlier could only fail. */
-    /* Safety net: if the early call could not publish (resource service not ready), retry from the
-       poll. A no-op once published. */
-    if (!link->published) fuxi_modem_publish();
+    if (link->ready && !link->published) {
+        link->published = 1;
+        fuxi_modem_publish();
+    }
     /* The services the bridge wants, asked for by name. The modem does not publish its whole list on its own: it
        answers a lookup with the services that match (Linux net/qrtr/ns.c, ctrl_cmd_new_lookup and lookup_notify),
        and a client that never asks never learns. The lookup is asked for once the modem's node is known, because the
@@ -966,24 +988,12 @@ static void fuxi_bridge_del_client(uint32_t local_port)
     qrtr_send_del_client(&link->qrtr, local_port);
 }
 
-/* Publishes the bridge's IOKit services. Called before the modem link exists: CommCenter decides whether
-   to start ABM early in boot and looks the services up once, so they have to be there whatever the modem is
-   doing. QMI requests wait in the bridge's queue (send returns -1) until the channel is up. Idempotent. The
-   bridge publishes nothing unless /chosen/coachz-baseband says so; that check is inside the configure. */
+/* The bridge's publish hook, called once the QRTR link is up. The bridge publishes nothing unless
+   /chosen/coachz-baseband says so. */
 void fuxi_modem_publish(void)
 {
-    fuxi_modem_link *link = &fuxi_link;
     extern void coachz_baseband_configure(int (*send)(uint32_t, uint32_t, uint32_t, const void *, uint32_t),
                                           void (*del_client)(uint32_t));
-    /* The adapter zeroes the link structure when it takes over (fuxi_modem_start), so the "already published"
-       fact lives here as well: the poll's retry then stays silent instead of publishing a second time. */
-    static int bridge_published;
-    if (bridge_published) {
-        link->published = 1;
-        return;
-    }
-    bridge_published = link->published = 1;
-    printf("FUXI_MODEM: publishing the baseband bridge before the link is up (services only; QMI waits for the channel)\n");
     coachz_baseband_configure(fuxi_bridge_send, fuxi_bridge_del_client);
 }
 
@@ -1140,8 +1150,14 @@ static void fuxi_logdump_read(unsigned second)
     /* What the two jobs themselves printed: their StandardErrorPath points here. */
     {
         static const char *const logs[] = {"/private/var/db/commcenter.log", "/private/var/db/abm-helper.log",
-                                           "/private/var/db/abm.log"};
-        static const char *const tags[] = {"FUXI_CC", "FUXI_ABM", "FUXI_ABMJOB"};
+                                           "/private/var/db/abm.log",
+                                           /* CommCenter's own system logs, when the job writes them. */
+                                           "/private/var/log/CommCenter.log", "/private/var/log/commcenter.log",
+                                           "/private/var/log/CommCenter-stderr.log",
+                                           "/private/var/log/CommCenter-stdout.log",
+                                           "/private/var/log/com.apple.CommCenter.log"};
+        static const char *const tags[] = {"FUXI_CC", "FUXI_ABM", "FUXI_ABMJOB",
+                                           "FUXI_CCLOG", "FUXI_CCLOG", "FUXI_CCLOG", "FUXI_CCLOG", "FUXI_CCLOG"};
         for (unsigned pass = 0; pass < sizeof logs / sizeof logs[0]; ++pass) {
             vnode_t vp2 = NULLVP;
             const int opened2 = vnode_open(logs[pass], FREAD | O_NOFOLLOW, 0, 0, &vp2, ctx);
@@ -1193,7 +1209,7 @@ static void fuxi_baseband_node_report(unsigned second)
 {
     if (second != 45u) return;
     DTEntry entry = NULL;
-    const void *value = NULL;
+    void *value = NULL;
     unsigned size = 0;
     /* The root compatible is what libTelephonyUtil's HWModelStr reads: it decides the radio module. */
     {
