@@ -1440,9 +1440,23 @@ IOReturn AppleBasebandPCIUserClient::read(IOExternalMethodArguments *args)
     }
     IOLockLock(bb_lock);
     bb_channel *ch = &bb_ch[fChannel];
-    static uint32_t refs_reads;
+    static uint32_t refs_reads, refs_answered;
     if (fChannel == CBH_REFS && refs_reads++ < 6)
       printf("COACHZ baseband: refs read waiting, request %u bytes, %u in queue\n", r.len, ch->count);
+    /* EXPERIMENT: the loader version record, as the BBU loader prints "Version is %s": answer the first read
+       with the version text and see whether the host takes it as the loader version. */
+    if (fChannel == CBH_REFS && refs_answered < 1 && r.len) {
+      static const char version[] = "Mav16-11.00.01";
+      uint8_t *buf = static_cast<uint8_t *>(IOMallocData(r.len));
+      if (buf) {
+        memset(buf, 0, r.len);
+        __builtin_memcpy(buf, version, sizeof version - 1);
+        bb_push(CBH_REFS, buf, r.len);
+        IOFreeData(buf, r.len);
+        refs_answered++;
+        printf("COACHZ baseband: refs answered with the version text (%s)\n", version);
+      }
+    }
     const bool queued = ch->reads_waiting < BB_READS;
     if (queued) ch->reads[ch->reads_waiting++] = r;
     if (queued && ch->count && bb_complete_call) thread_call_enter(bb_complete_call);
