@@ -36,7 +36,7 @@
 // NAS frames left the SIM and registration state stale until the SIM was reinserted. A dropped frame is a lost answer: keep room.
 #define BB_QUEUE 1024u
 #define BB_READS 8u                      // asynchronous reads waiting for a frame, per channel
-#define BB_TX 256u                       // QMI messages waiting for the Wi-Fi thread (a boot burst can be 400+ frames)
+#define BB_TX 1024u                      // QMI messages waiting for the Wi-Fi thread (a boot burst can be 400+ frames)
 #define BB_SYNC_READ_SECONDS 30u
 
 // Which SAHARA images the device end asks for. SBL1 (Qualcomm image id 0x15) is the first image a boot loader requests; the rest of

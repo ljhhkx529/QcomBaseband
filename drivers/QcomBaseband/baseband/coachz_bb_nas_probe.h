@@ -44,13 +44,17 @@
 
 /* The operating mode (Qualcomm's dms_service_v01.h). */
 enum cbn_operating_mode {
-    CBN_MODE_OFFLINE = 0,
-    CBN_MODE_ONLINE = 1,
-    CBN_MODE_LOW_POWER = 2,
-    CBN_MODE_FACTORY_TEST = 3,
+    /* Qualcomm's dms_service_v01.h, and the same numbers the UMI port names: 0 online, 1 low power,
+       3 offline, 6 persistent low power, 7 mode-only low power. The earlier table had these shifted by one,
+       which made an online modem print as "offline" and sent the search for the missing service in the wrong
+       direction. */
+    CBN_MODE_ONLINE = 0,
+    CBN_MODE_LOW_POWER = 1,
+    CBN_MODE_FACTORY_TEST = 2,
+    CBN_MODE_OFFLINE = 3,
     CBN_MODE_SHUTTING_DOWN = 4,
-    CBN_MODE_PERSIST = 5,
     CBN_MODE_LOW_POWER_ONLY = 6,
+    CBN_MODE_PERSIST = 7,
 };
 
 /* The registration state (libqmi's QmiNasRegistrationState). */
