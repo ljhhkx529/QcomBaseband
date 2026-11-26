@@ -262,7 +262,10 @@ static inline uint32_t cbs_receive(struct cbs_device *d, const uint8_t *in, uint
         uint8_t *p = cbs_packet(o, CBS_DONE_RESP, 0x0c);
         cbs_put32(p + 8, last ? 1u : 0u);
         if (last) {
-            d->state = CBS_FINISHED;
+            /* EXPERIMENT: after the last image the loader switches to command mode; the host's next
+               HELLO should be answered by our COMMAND_READY instead of leaving the session finished. */
+            cbs_hello(o, CBS_MODE_COMMAND);
+            d->state = CBS_WAIT_HELLO_RESP;
         } else {
             d->image_index++;
             cbs_hello(o, CBS_MODE_IMAGE_PENDING);
