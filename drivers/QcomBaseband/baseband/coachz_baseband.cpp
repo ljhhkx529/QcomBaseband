@@ -827,6 +827,53 @@ static void bb_radio_again(void)
   printf("COACHZ radio: signal and serving system asked again %d, t %u\n", bb_radio_tries, now);
 }
 
+/* ---- NAS indications to the host ----------------------------------------------------------------
+ *
+ * The host subscribes (Register Indications 0x03, cid 1/4/5/6) and the modem answers the subscription,
+ * but the modem sends no indication when the registration finishes: the host's view is only what it polls,
+ * and what it polls while the radio was still coming up. So the state the modem just reported is also
+ * delivered as the indication the host subscribed to: Serving System (0x24) when the registration or the
+ * network changes, Signal Info (0x51) when the signal changes. The bytes are the modem's own answer's
+ * TLVs (the result TLV is dropped, an indication has none), so the host parses exactly what the modem said.
+ */
+static void bb_nas_indicate(uint32_t msg, const uint8_t *sdu, uint32_t size)
+{
+  static uint8_t have_reg, last_reg, have_net;
+  static uint16_t last_mcc, last_mnc;
+  static uint8_t have_sig;
+  static int16_t last_rsrp;
+  if (msg == 0x24u) {
+    if (have_reg && have_net && last_reg == bb_radio.reg_state && last_mcc == bb_radio.mcc && last_mnc == bb_radio.mnc) return;
+    have_reg = 1u; last_reg = bb_radio.reg_state;
+    if (bb_radio.have_plmn) { have_net = 1u; last_mcc = bb_radio.mcc; last_mnc = bb_radio.mnc; }
+  } else {
+    if (have_sig && last_rsrp == bb_radio.rsrp) return;
+    have_sig = 1u; last_rsrp = bb_radio.rsrp;
+  }
+  uint8_t ind[512];
+  uint32_t n = 0;
+  ind[n++] = 0x04u; ind[n++] = 0x00u; ind[n++] = 0x00u;
+  ind[n++] = (uint8_t)(msg & 0xffu); ind[n++] = (uint8_t)(msg >> 8);
+  const uint32_t len_at = n; n += 2u;
+  const uint32_t end = (size >= 7u) ? 7u + (uint32_t)(sdu[5] | sdu[6] << 8) : 0u;
+  for (uint32_t at = 7u; at + 3u <= end;) {
+    const uint32_t type = sdu[at];
+    const uint32_t l = (uint32_t)(sdu[at + 1] | sdu[at + 2] << 8);
+    if (at + 3u + l > end) break;
+    if (type != CBN_TLV_RESULT) { memcpy(ind + n, sdu + at, 3u + l); n += 3u + l; }
+    at += 3u + l;
+  }
+  ind[len_at] = (uint8_t)((n - 7u) & 0xffu); ind[len_at + 1] = (uint8_t)((n - 7u) >> 8);
+  uint32_t sent = 0;
+  for (uint32_t i = 0; i < CBQ_MAX_CLIENTS; i++) {
+    const struct cbq_client *c = &bb_qmux.client[i];
+    if (!c->used || c->service != CBN_SVC_NAS || c->channel == CBQ_INTERNAL) continue;
+    const struct cbq_result r = cbq_from_modem(&bb_qmux, CBQ_PORT_BASE + i, 0, ind, n, bb_out, sizeof bb_out);
+    if (r.kind == CBQ_TO_HOST && r.len) { bb_push(r.channel ? CBH_QMUX2 : CBH_QMUX1, bb_out, r.len); ++sent; }
+  }
+  if (sent) printf("COACHZ nas-indicate: message 0x%x delivered to %u host NAS clients\n", msg, sent);
+}
+
 /* ---- registration: what the UMI port does and this bridge did not ----------------------------------
  *
  * The modem does not register on its own. UMI's port (drivers/modem/hakios.mpss.c, sim_probe) sends three NAS
@@ -2030,12 +2077,14 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
           cbn_take_serving_system(&bb_radio, sdu, size);
           printf("COACHZ register: the serving system answer: error %u\n", bb_reg.error);
           bb_radio_log();
+          bb_nas_indicate(0x24u, sdu, size);
         } else if (m == CBN_NAS_GET_SIGNAL_INFO) {
           const int got = cbn_take_signal(&bb_radio, sdu, size);
           printf("COACHZ register: the signal answer: error %u, %u TLVs, decoded %d\n", bb_reg.error, bb_reg.tlv_count, got);
           for (uint32_t q = 0; q < bb_reg.tlv_count && q < 16u; q++)
             printf("COACHZ register: signal TLV type 0x%02x of %u bytes\n", bb_reg.tlv_types[q], bb_reg.tlv_lens[q]);
           bb_radio_log();
+          bb_nas_indicate(0x51u, sdu, size);
         } else {
           printf("COACHZ register: answer message 0x%x: error %u, %u TLVs\n", m, bb_reg.error, bb_reg.tlv_count);
         }
